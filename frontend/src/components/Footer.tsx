@@ -1,0 +1,1 @@
+export default function Footer(){return <footer className="border-t border-slate-200 bg-white py-2 text-center text-[9px] text-slate-400">Powered by OpenAI <span aria-hidden>•</span> ChromaDB <span aria-hidden>•</span> FastAPI <span aria-hidden>•</span> Version 1.0.0</footer>}

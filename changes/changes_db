@@ -1,0 +1,524 @@
+## 2026-07-23 — Structured workbook storage
+
+- Files changed: `backend/app/database.py`.
+- Change summary: added `workbook_sheets` and `workbook_rows` with content, owner, sheet, row, headers, typed JSON values, visibility, and processing-status metadata; added `sheet_name` and `row_number` provenance columns to `chunks`; added owner/content and sheet/row indexes.
+- Reason: deterministic workbook-wide calculations require complete structured rows while semantic retrieval requires sheet-level provenance.
+- Test result: the migration and owner-scoped queries passed the complete 51-test backend suite, including legacy database migration and unauthorized-workbook coverage.
+## 2026-07-24 — Multi-tenant metadata, versions, jobs, and lifecycle migration
+
+- Added migration ledger versions `002_multitenant_rag` and `003_operational_jobs`.
+- Added `organizations`, tenant-scoped users with `(organization_id, email)` uniqueness and roles, `document_versions`, `ingestion_jobs`, `document_permissions`, `chat_sessions`, and `chat_messages`.
+- Added organization keys, lifecycle timestamps, visibility/current-version links, chunk document/version provenance, structured source locations, request/job audit correlation, durable job results, and supporting tenant/status/current-version indexes.
+- Backfilled every existing user and row into the default UUID organization, created version 1 for every existing document, linked legacy chunks to their document/version, and preserved all existing rows.
+- Rebuilt request-limit and LLM-usage primary keys to include `organization_id`.
+- The live migration created `backend/data/rag_new.db.pre_multitenant_rag.bak`; post-migration `PRAGMA integrity_check` returned `ok`, all 5 existing documents became 5 version records, and no user was left without an organization.
+- Reindexed 147 active current-version chunks into the clean local Qdrant collection.
+
+## 2026-07-27 14:31:12 +05:30 — Ingestion observability and migration validation
+
+- Change summary: added `extraction_duration_ms`, `embedding_duration_ms`, `indexing_duration_ms`, `chunks_created`, and `vector_upsert_failures` to `ingestion_jobs`; content reuse queries now require an active readable same-tenant document reference.
+- Files changed: `backend/app/database.py`, `backend/app/services/ingestion_jobs.py`, and `backend/app/routes/health.py`.
+- Reason: persist operational measurements without reconstructing them from logs and enforce the ACL boundary at duplicate-content reuse time.
+- Migration impact: idempotent migration `006_ingestion_metrics` preserves all rows, uses nullable durations and zero-default counters, and records completion in `schema_migrations`. Post-migration validation checks foreign keys and tenant ownership before commit; rollback and the existing pre-migration backups remain the recovery path.
+- Security impact: normalized content identifiers are no longer reusable solely because their hashes match inside an organization; the requesting owner must be authorized to read an active referencing document.
+- Tests: migration/schema and multi-tenant lifecycle tests pass; complete regression results are recorded in the final verification entry.
+
+## 2026-07-27 14:43:47 +05:30 — Final database verification
+
+- Files verified: `backend/app/database.py`, all schema consumers, legacy migration fixture, and tenant/version/content/job integration tests.
+- Reason: confirm that the additive migration and integrity gate preserve existing data and enforce tenant relationships.
+- Test result: the complete 71-test backend suite passed, including legacy migration backup/preservation, schema ledger, job metrics, version ownership, content reuse boundaries, and soft-delete/restore behavior.
+- Migration/security result: migration `006_ingestion_metrics` is idempotent and additive; foreign-key and tenant-ownership validation runs before commit and rolls the transaction back on failure.
+
+## 2026-07-27 15:20:46 +05:30 — Lifecycle cascade column repair
+
+- Change summary: migration `007_lifecycle_repair` verifies and adds `deleted_with_document` on `document_versions`, `document_contents`, and `chunks`.
+- Files changed: `backend/app/database.py`, `backend/tests/test_multitenant_architecture.py`.
+- Reason: historical migration `004_document_lifecycle` was already recorded in the live database before these columns were introduced, so ledger-only migration checks could not repair it.
+- Migration impact: no rows are rewritten or removed; missing columns receive `INTEGER NOT NULL DEFAULT 0`. Startup validates the physical schema on every run and records `007_lifecycle_repair` idempotently.
+- Security impact: delete/restore provenance remains tenant-scoped and separately deleted versions cannot be unintentionally restored.
+- Tests: a simulated partially applied historical database is repaired successfully, and the delete/restore lifecycle integration test passes.
+
+## 2026-07-30 - Deleted-document re-upload database investigation
+
+Investigation only. No schema or data changes were made.
+
+### Confirmed constraint conflict
+
+- `document_contents` is soft-deleted; the historical row and normalized hash
+  remain.
+- `idx_document_contents_owner_content_hash` is an unconditional unique index on
+  `(owner_id, normalized_content_hash)`.
+- The worker excludes deleted content from reuse, then updates a new placeholder
+  with the same normalized hash.
+- SQLite raises `UNIQUE constraint failed:
+  document_contents.owner_id, document_contents.normalized_content_hash` at
+  `backend/app/services/ingestion_jobs.py:664-668`.
+- The failed transaction creates no new chunks or vectors. The placeholder content,
+  version, document, job, and stored file were committed by the earlier queue stage
+  and remain with failed/pending lifecycle state.
+
+### Read-only database verification
+
+- `PRAGMA integrity_check`: `ok`.
+- `PRAGMA foreign_key_check`: no violations.
+- Rows: 31 documents, 31 versions, 30 content rows, 914 chunks, 26 ingestion jobs,
+  546 audit events, 39 workbook sheets, and 319 workbook rows.
+- Soft-deleted: 29 documents, 29 versions, 28 contents, and 906 chunks.
+- Active: 2 documents, 2 versions, 2 contents, and 8 chunks.
+- Job state: 15 completed, 3 cancelled, and 8 failed with
+  `internal_processing_error`.
+- No physical FK orphans were found for content-without-version,
+  chunk-without-content, chunk-without-version, or version-without-document.
+- There is no separate embeddings table. Embeddings are JSON stored on `chunks`.
+  All 906 deleted chunks retain embeddings and vector point IDs.
+- Audit rows and workbook metadata are intentionally retained. All 39 workbook
+  sheet rows currently reference soft-deleted content; they are not FK orphans.
+
+### Tables affected by soft delete
+
+- `documents`: `deleted_at`, `deleted_by`, `updated_at`.
+- `document_versions`: `deleted_at`, `deleted_by`,
+  `deleted_with_document`; queued versions may become cancelled.
+- `chunks`: `deleted_at`, `deleted_by`, `deleted_with_document`.
+- `document_contents`: soft-deleted only when no active version on an active
+  document references it.
+- `ingestion_jobs`: queued/retry jobs are cancelled.
+- Not deleted: audit events, workbook tables, permissions, inline embeddings,
+  stored keys, and historical job rows.
+
+Hard delete removes chunks, jobs, permissions, versions, the document, and
+unreferenced content. Workbook rows/sheets cascade when content is physically
+removed. Audit events are retained.
+
+### Constraint inventory and impact
+
+- Root cause: unique `(owner_id, normalized_content_hash)` on all content rows,
+  including deleted rows.
+- Additional defect: the inspected database contains both unique chunk indexes:
+  `(content_id, chunk_index)` and `(content_id, version_id, chunk_index)`.
+  The former is obsolete and can block per-version chunks when active content is
+  reused.
+- Cause of obsolete index return: `_create_indexes` executes on every startup
+  before migration-ledger checks and recreates it. A clean first initialization
+  drops it during migration 002, so current tests miss the restart regression.
+- `documents(owner_id, display_filename)` is unique across deleted and active rows.
+  The generator avoids failure by suffixing re-upload display names.
+- `document_versions(organization_id, document_id, version_number)` is unique and
+  correct for immutable versions.
+- Raw file hash and stored filename are not unique.
+- Jobs enforce organization-scoped idempotency uniqueness.
+- Foreign keys are enabled per runtime connection and currently valid.
+
+### Transaction findings
+
+- Soft-delete SQL updates are atomic within `BEGIN IMMEDIATE`.
+- SQLite and Qdrant are not one transaction. Qdrant is changed first, with only
+  best-effort compensation on a caught SQL exception.
+- Queue-time file storage precedes the SQL queue transaction; an exception removes
+  the new file.
+- Worker content/chunk persistence is one SQL transaction. The confirmed constraint
+  error rolls it back.
+- Qdrant upsert and final version activation are later stages, enabling retry but
+  permitting cross-system partial states.
+- Hard delete spans Qdrant, SQL, and filesystem without a durable coordinator.
+
+### Recommended migration design (not implemented)
+
+1. Audit for active normalized-hash duplicates and active chunk-index duplicates.
+2. Drop `idx_document_contents_owner_content_hash`.
+3. Create an active-only partial unique index aligned to the tenant/owner policy,
+   for example `(organization_id, owner_id, normalized_content_hash)
+   WHERE deleted_at IS NULL`.
+4. Drop `idx_chunks_content_chunk_index`, remove its creation from the startup
+   base-index function, and retain `(content_id, version_id, chunk_index)`.
+5. Make the migration idempotent and verify physical schema, not only the migration
+   ledger, so partially applied and restarted databases self-heal.
+6. Define restore conflict behavior before deployment because a replacement active
+   row may own the same content identity.
+7. Preserve all soft-deleted data during migration. Handle failed placeholders and
+   retained files only through a separately approved, audited cleanup procedure.
+
+## 2026-07-30 11:38:13 +05:30 — Active content identity migration
+
+### Migration
+
+- File modified: `backend/app/database.py`.
+- Added idempotent migration ledger entry `008_active_content_indexes`.
+- Before index changes, the migration verifies required table columns and checks
+  for conflicting active owner/hash rows and duplicate
+  `(content_id, version_id, chunk_index)` rows. A conflict aborts startup with a
+  diagnostic; it never selects or deletes customer history automatically.
+- Removed `idx_document_contents_owner_content_hash`, the unconditional unique
+  index on `(owner_id, normalized_content_hash)`.
+- Created `idx_document_contents_owner_active_content_hash`, unique on
+  `(owner_id, normalized_content_hash) WHERE deleted_at IS NULL`.
+- Removed obsolete `idx_chunks_content_chunk_index` on
+  `(content_id, chunk_index)` and retained
+  `idx_chunks_content_version_index` on
+  `(content_id, version_id, chunk_index)`.
+- Removed obsolete index creation from the startup base-index function so an
+  application restart cannot recreate the old constraints.
+- Added `PRAGMA integrity_check` to startup validation before the existing
+  foreign-key and tenant-integrity checks.
+
+### Data, security, and compatibility
+
+- The migration drops and creates indexes only. It does not rewrite or delete
+  documents, contents, chunks, embeddings, workbook metadata, audit events, or
+  stored files.
+- Active uniqueness remains scoped to authenticated content ownership. Deleted
+  rows can retain the same normalized hash, while simultaneous active duplicates
+  remain database-enforced.
+- Search schema and vector payloads do not require reindexing. Existing active
+  uploads, immutable versions, and historical soft-delete data remain compatible.
+
+### Verification
+
+- The migration ran twice against an isolated copy of
+  `backend/data/rag_new.db`.
+- Results after the second run: `PRAGMA integrity_check = ok`,
+  `PRAGMA foreign_key_check` returned 0 rows, one v8 ledger entry existed, both
+  obsolete indexes were absent, both replacement indexes had the expected SQL,
+  and active-content/version-chunk duplicate counts were zero.
+- Migration restart and deliberate-conflict tests passed as part of the complete
+  82-test backend suite.
+
+### Rollback
+
+- Take a database backup before deployment. To roll back safely, stop all workers,
+  restore that backup, deploy the matching prior application, and then start the
+  service. Do not recreate the old unconditional indexes on a database that has
+  accepted deleted-content re-uploads without first auditing for duplicate
+  historical hashes and per-version chunks.
+
+## 2026-07-30 12:13:31 +05:30 — Qdrant collection configuration
+
+- No SQLite schema or row changes were required.
+- The existing single `rag_chunks` collection remains the vector persistence
+  model; no per-user or per-organization collections were introduced.
+- Remote Qdrant startup now ensures payload indexes for the exact tenant, ACL,
+  document/version, and lifecycle fields used by filtered searches.
+- Collection vector size remains governed by `EMBEDDING_DIMENSION`. Startup fails
+  clearly if the existing collection size differs, preventing mixed-dimension
+  writes after an embedding-model change.
+- Rollback does not require removing payload indexes. They contain no separate
+  customer records and can remain after reverting application code.
+
+## 2026-07-30 12:25:40 +05:30 — Migration 009 chunk vector synchronization
+
+- File modified: `backend/app/database.py`.
+- Added idempotent migration `009_chunk_vector_sync`.
+- Added `chunks.qdrant_indexed_at` and `chunks.indexing_status`, defaulting new
+  chunks to `pending`. The existing `vector_point_id` column is the canonical
+  equivalent of the requested `vector_id`; no duplicate alias column was added.
+- Replaced the non-unique organization/vector index with partial unique index
+  `ux_chunks_vector_point_id` on non-null `vector_point_id`.
+- Before creating the unique index, migration 009 counts duplicate non-null point
+  IDs and aborts with a diagnostic instead of modifying conflicting data.
+- Historical rows with a point ID are backfilled to `completed`; rows without one
+  remain `pending`. Exact historical Qdrant timestamps are not fabricated, so
+  `qdrant_indexed_at` remains null until an upsert or reconciliation confirms the
+  point.
+- The migration ran twice against an isolated copy of the current database.
+  Results: integrity `ok`, zero foreign-key violations, one migration ledger row,
+  all three synchronization columns present, unique index present, zero duplicate
+  point IDs, and 925 historical rows classified as completed.
+- No live database or customer row was modified during validation.
+- Rollback: restore the pre-deployment SQLite backup for a physical schema
+  rollback. The additive columns and unique index are otherwise safe for older
+  readers that select explicit columns.
+
+## 2026-07-30 12:52:50 +05:30 — SQLite/Qdrant source-of-truth boundary
+
+- No additional schema migration was required beyond
+  `009_chunk_vector_sync`.
+- New canonical ingestion rows store complete chunk text and provenance in
+  SQLite, set `chunks.embedding` to null, and commit with
+  `indexing_status = 'pending'` before any embedding-provider or Qdrant call.
+- Successful Qdrant upserts transition the corresponding rows to `completed`
+  and set `qdrant_indexed_at`; failed upserts transition them to `failed`.
+  Document, version, content, and chunk completion changes remain in one final
+  SQLite transaction.
+- The nullable historical `chunks.embedding` column is retained for backward
+  compatibility and rollback safety. Existing values are not rewritten or
+  deleted. Reindex uses a valid historical vector when present and regenerates
+  one from `chunks.text` when absent.
+- Qdrant is the embedding source for retry reuse, while SQLite is the
+  authoritative text and metadata source for retrieval. A provider miss cannot
+  be mistaken for a durable embedding because retry requires every expected
+  deterministic point ID and configured vector dimension.
+- No user data, stored files, Qdrant collections, constraints, indexes, or live
+  database rows were modified by this application-only change. The 85-test
+  backend suite validated the new transaction boundaries against isolated
+  SQLite databases and in-memory Qdrant stores.
+- Rollback requires only the matching application rollback. No database restore
+  is needed for these semantics; keep migration 009 when retaining the indexed
+  state columns.
+
+## 2026-07-30 13:11:04 +05:30 — Vector cutover data policy
+
+- No schema migration was added and `chunks.embedding` was not dropped.
+- The one-time command reads active current-version chunks and may reuse the
+  legacy JSON only when model, dimension, numeric type, and finiteness checks all
+  pass. Otherwise it regenerates the vector from `chunks.text`.
+- Apply mode updates only `vector_point_id`, `embedding_model`,
+  `embedding_dimension`, `indexing_status`, and `qdrant_indexed_at`. It does not
+  rewrite document text, legacy embedding JSON, permissions, jobs, audit data,
+  or file metadata.
+- Stable point-ID collisions are checked before mutation. The migration marks
+  selected rows pending before external writes, completed only after exact
+  Qdrant point verification and filtered test queries, and failed after any
+  migration-stage exception.
+- Existing legacy vectors remain the rollback copy through at least one
+  validated release and successful rollback exercise. Removing the column
+  requires a future migration with a fresh coordinated backup and explicit
+  rollback test.
+- Operational backups must capture SQLite, Qdrant, and uploaded object storage
+  from the same maintenance window. Embedded local Qdrant requires stopped API
+  and worker processes during backup and migration.
+- No live database was mutated. The migration was exercised against isolated
+  databases; the complete 87-test backend suite passed.
+
+## 2026-07-30 14:38:01 +05:30 — Rollout reconciliation and SQLite fallback
+
+- No schema migration or column removal was performed.
+- `chunks.embedding` remains the temporary rollback field. When
+  `VECTOR_STORE_ROLLBACK_DUAL_WRITE=true`, new vectors are written there only
+  after a successful Qdrant upsert; failed Qdrant ingestion is never falsely
+  marked completed.
+- SQLite fallback reads only valid finite vectors with the configured dimension
+  and searches only authenticated tenant/ACL scope, active documents/chunks, and
+  explicitly allowed current versions.
+- The consistency script is read-only. Its canonical SQLite set is limited to
+  completed active current-version chunks with non-null point IDs and completed
+  indexing state. It compares exact IDs with active provider points and reports
+  unique `(content_id, chunk_index)` counts separately.
+- Isolated tests verified completed state, point-ID equality, soft deletion,
+  retained audit events, dual-write rollback, partial-batch failure state, and
+  idempotent retry. No workspace or production database rows were modified.
+- Active same-content/different-name sharing remains a known policy mismatch:
+  canonical async ingestion rejects it, while the requested rollout design
+  expects shared content-scoped vectors. No database model was changed pending a
+  deliberate decision on shared point ownership and deletion semantics.
+- Keep coordinated SQLite, Qdrant, and object-storage backups before any real
+  provider switch. Do not drop `chunks.embedding` until the remote rollout,
+  20–30-question comparison, and rollback exercise all pass.
+## 2026-07-30 15:30 +05:30 — CSV structured-range findings
+
+- No schema, constraint, index, migration, or production-data change was needed.
+- Previously CSV uploads populated documents, contents, versions, and
+  row-oriented chunks, but not the existing `workbook_sheets` /
+  `workbook_rows`. That forced exhaustive ranges into semantic top-K retrieval.
+- New CSV ingestion reuses those existing workbook tables. SQLite remains
+  authoritative for headers, typed values, physical rows, text, lifecycle,
+  ownership, and ACL hydration; Qdrant remains the semantic vector index.
+- Organization/owner/current-version/soft-delete predicates, point IDs, payload
+  schema, duplicate policy, and the legacy rollback vector field are unchanged.
+- Existing CSV documents require controlled reindex or re-upload. Take the
+  coordinated SQLite/Qdrant/object-storage backup before a production backfill.
+
+## 2026-07-30 16:00 +05:30 — Structured CSV indexing state
+
+### Files changed
+
+- `backend/app/database.py`
+- `backend/app/services/workbooks.py`
+- `backend/app/services/ingestion_jobs.py`
+- `backend/tests/test_structured_index_migration.py`
+- `backend/tests/test_multitenant_architecture.py`
+- `backend/tests/test_qdrant_integration.py`
+
+### Reason and migration behavior
+
+- Added migration `010_structured_csv_indexing` to track structured indexing on
+  `document_contents`, matching the existing content-scoped workbook tables and
+  duplicate-content model.
+- Added `structured_index_status`, `structured_index_version`,
+  `structured_indexed_at`, and `structured_index_error`.
+- Existing rows receive `structured_index_status = 'pending'`; the migration
+  does not infer completion from chunks, vectors, filenames, or existing
+  workbook rows. Version, timestamp, and error remain null.
+- Status is constrained to `pending`, `processing`, `completed`, or `failed`.
+  Version values are limited to 100 characters and errors to 500 characters.
+  The shared sanitizer removes control characters, collapses whitespace, and
+  truncates safe public messages before future persistence.
+- Added one partial retry index over active pending/failed content:
+  `idx_contents_structured_retry`. No completed or soft-deleted row is included.
+- Successful production workbook persistence now stamps
+  `structured-workbook-v1`, completion time, and a null error in the same
+  transaction as sheet/row replacement.
+- No document, version, chunk, vector, ownership, organization, soft-delete,
+  normalized-hash, or duplicate-content relationship is rewritten.
+- Rollback: application rollback is safe before migration use. Physical schema
+  rollback requires the normal pre-deployment SQLite backup because SQLite
+  column removal is a separate migration; the additive columns are otherwise
+  backward compatible with readers that select explicit columns.
+
+### Test results
+
+- 9 focused migration, restart, lifecycle, legacy-upgrade, and production CSV
+  tests passed in 66.563 seconds.
+- The production CSV status assertion passed independently in 9.700 seconds.
+- 4 duplicate-content, owner-isolation, and soft-delete regressions passed in
+  20.612 seconds.
+- Python compilation passed.
+- `git diff --check` passed; only the repository's existing CRLF conversion
+  warnings were reported.
+
+## Structured Workbook Chat DB State Note - 2026-07-31 15:14:23 +05:30
+
+### Database impact
+
+- No schema migration was required for the permanent wrong-document and
+  unavailable-answer fix.
+- Existing ACL, organization, document, workbook sheet, workbook row, chunk, and
+  vector tables are read through the existing owner/org-filtered access paths.
+- The fix changes selection/ranking behavior in application code only; it does
+  not rewrite uploaded files, workbook rows, chunks, Qdrant vectors, or source
+  citations already stored in SQLite.
+
+### Verification
+
+- Regression coverage confirms unrelated workbooks cannot win or be cited when
+  scoped evidence is insufficient.
+- Unavailable responses remain `grounded=false` with `sources=[]`.
+- Backend tests passed:
+  `tests.test_workbook_domain_neutral` ran 18 tests successfully, and
+  `tests.test_chat` ran 10 tests successfully.
+
+## Filename-Free Chat Selection DB Note - 2026-07-31 15:33:27 +05:30
+
+### Database impact
+
+- No schema migration was required.
+- The application now explicitly joins `document_versions` when loading
+  structured workbook scopes and when performing default vector retrieval, so
+  only completed current versions are eligible for automatic source selection.
+- Existing document, workbook, chunk, vector, owner/org ACL, and citation data
+  were not rewritten.
+
+### Verification
+
+- Employee-count, Aparna/July, quality-report rejection quantity, follow-up
+  naming, weak unrelated evidence, unavailable response, and no filename-prompt
+  behavior are covered by focused backend regressions.
+- Backend tests passed:
+  `tests.test_workbook_domain_neutral` ran 19 tests successfully,
+  `tests.test_chat` ran 11 tests successfully, and
+  `tests.test_legacy_csv_reindex_retrieval tests.test_qdrant_integration` ran
+  12 tests successfully.
+
+## Chat Follow-Up Context DB Note - 2026-07-31 15:49:56 +05:30
+
+### Database change
+
+- Added migration `011_chat_context_followups`.
+- Added `chat_contexts` with owner/org/conversation scoping, expiry, bounded
+  JSON context, and soft-delete support.
+- Added `idx_chat_contexts_owner_conversation` for latest-context lookup by
+  organization, owner, conversation, expiry, and deletion state.
+
+### Stored context boundaries
+
+- Stored fields are limited to previous question, previous grounded answer,
+  cited document/version IDs, source metadata, structured intent metadata, and
+  bounded workbook row references.
+- No API keys, prompts, full workbook/PDF contents, or inaccessible filenames
+  are stored.
+- Context is validated against current owner/org ACLs and completed current
+  document versions before it is saved or reused.
+
+### Verification
+
+- Regression tests covered total/count follow-up row listing, employee count
+  followed by naming, unrelated-document exclusion, ambiguous pronoun
+  clarification, unavailable-without-context behavior, and isolation across
+  users/conversations.
+
+## Stale Follow-Up Context DB Note - 2026-07-31 16:11:49 +05:30
+
+### Investigation
+
+- Active `chat_contexts` inspection found no records for the failing browser
+  exchange, so there were no persisted candidate prior grounded turns to rank.
+- The failure therefore came from missing context causing a fallback to normal
+  workbook analysis, not from a valid newer total context being explicitly
+  outranked by an older people context.
+- The DB ordering risk was still real: context lookup used `created_at DESC`,
+  which can tie for rapid messages because SQLite timestamps are second
+  precision.
+
+### Implementation impact
+
+- No schema migration was required.
+- The latest context query now relies on `chat_contexts.id DESC`, the
+  autoincrement insertion order, to identify the immediately preceding grounded
+  turn within the same owner/org/conversation.
+- Source/result-plan mismatch is rejected before insert, so stale or
+  contradictory row plans are not persisted.
+- Existing context rows remain compatible; future rows include richer typed
+  result-plan JSON fields such as `result_type`, `display_column`, and
+  `contributing_values`.
+
+### Verification
+
+- Regression tests covered total-result follow-up listing, employee-count
+  follow-up naming, latest grounded turn beating older people context,
+  cross-user/cross-chat isolation, missing conversation context returning
+  unavailable, and source-plan mismatch rejection.
+
+## Generic Schema-Driven RAG DB Note - 2026-07-31 17:58:59 +05:30
+
+### Database change
+
+- Added `schema_json` to `workbook_sheets`.
+- Existing databases are migrated with
+  `ALTER TABLE workbook_sheets ADD COLUMN schema_json TEXT NOT NULL DEFAULT '{}'`.
+- New spreadsheet ingestion stores compact per-sheet column schema containing
+  column name, inferred data type, non-empty count, and unique count.
+
+### Stored representation
+
+- Workbook structured storage now preserves sheet names, row numbers, headers,
+  inferred column data types, and row values for all processed sheets.
+- Source citations continue to use exact document/version IDs plus sheet and
+  row ranges.
+- No prompts, credentials, API keys, or inaccessible document contents are
+  stored in schema metadata.
+
+### Verification
+
+- Migration and reindex coverage passed in:
+  `venv\Scripts\python.exe -m unittest tests.test_structured_index_migration tests.test_structured_csv_reindex tests.test_reindex_structured_csv_script tests.test_chat tests.test_workbook_domain_neutral`
+  with 42 tests passing in 57.960 seconds.
+
+## Qdrant Test Isolation DB Note - 2026-07-31 18:23:27 +05:30
+
+- No database schema changed for the Qdrant test-isolation fix.
+- No production data, production Qdrant path, or real Qdrant collection was
+  modified or deleted.
+- Test changes use temporary databases, SQLite rollback vectors, in-memory
+  Qdrant, or `TemporaryDirectory()`-backed Qdrant local storage only.
+- The vector-store singleton reset change affects only cached in-process test
+  state and does not alter persisted database data.
+
+## Local hybrid retrieval DB note - 2026-08-10
+
+- Date: 2026-08-10.
+- Task name: Add keyword/BM25 retrieval alongside vector search.
+- Affected files: `changes/changes_db` only; no database migration files changed.
+- What changed: no persistence schema, indexes, triggers, or production records were changed. Keyword scoring reads the existing authorized `chunks`, `documents`, and `document_versions` data.
+- Why: the lightweight lexical path can use current local data without a separate search service or duplicate index.
+- Validation performed: temporary-database integration tests verified private-document ACL, soft deletion, and non-completed current-version exclusion.
+- Known limitations: keyword scoring is query-time computation over eligible local chunks; it does not create a persistent full-text index.
+
+## Confirmed orphan Qdrant point repair - 2026-08-10
+
+- Date: 2026-08-10.
+- Task name: Remove confirmed stale local-Qdrant points.
+- Affected files: changes/changes_db; no SQLite schema or migration changed.
+- What changed: physically removed Qdrant point IDs 5e6a91d4-dc43-539e-bd0f-1d275db56d2b and 64edf488-6065-5ec8-9292-f84d31b3bc4c after a dry-run verified that each had no same-organization SQLite chunk, no active/current equivalent, and no active ingestion job.
+- Why: both legacy/default-organization points remained marked active even though their matching SQLite lifecycle records had been soft-deleted under a different organization and their current vector IDs had changed.
+- Validation performed: before: 95 active SQLite chunks and 97 active vectors with two named orphans. After: 95 active SQLite chunks and 95 active vectors; zero orphan, missing, duplicate, wrong-version, or deleted-document active vectors.
+- Known limitations: this was a point-ID-only repair; no SQLite records, schemas, ACLs, document contents, or valid vectors were changed.

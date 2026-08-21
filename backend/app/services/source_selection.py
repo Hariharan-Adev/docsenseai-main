@@ -1,0 +1,596 @@
+"""Authoritative source selection and grounded-answer invariants."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import re
+from typing import TYPE_CHECKING, Literal
+
+from app.config import settings
+from app.database import get_connection
+from app.prompts.rag_prompt import UNAVAILABLE_ANSWER
+from app.services.document_access import READABLE_DOCUMENT_SQL
+from app.services.vector_search import search_chunks
+from app.services.workbook_analysis import (
+    _answer_employee_profiles,
+    _load_scopes,
+    _plan_for_scope,
+    _source_evidence,
+)
+from app.utils.observability import log_event
+
+if TYPE_CHECKING:
+    from app.services.rag_diagnostics import RagRequestDiagnostic
+
+
+SelectionPath = Literal["structured", "retrieval", "unavailable", "clarification"]
+
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
+    "file", "for", "from", "give", "how", "in", "is", "it", "many", "me",
+    "much", "of", "on", "or", "show", "tell", "than", "that", "the", "them",
+    "there", "these", "they", "this", "those", "to", "was", "were", "what",
+    "which", "with",
+}
+GENERIC_COLUMNS = {"column", "field", "value", "data", "name", "type", "status"}
+MIN_RETRIEVAL_SCORE = 3
+MIN_STRUCTURED_SCORE = 5
+AMBIGUITY_MARGIN = 2
+
+
+@dataclass
+class CandidateDecision:
+    """Safe diagnostic summary for one candidate document."""
+
+    document_id: int
+    source_type: str
+    score: int
+    semantic_score: float = 0.0
+    schema_score: int = 0
+    context_score: int = 0
+    reasons: list[str] = field(default_factory=list)
+    rejection_reason: str | None = None
+
+
+@dataclass
+class SelectionResult:
+    """Decision returned by the single source-selection gate."""
+
+    path: SelectionPath
+    document_id: int | None = None
+    version_id: int | None = None
+    sources: list[dict[str, object]] = field(default_factory=list)
+    reason: str = "insufficient_evidence"
+    diagnostics: list[CandidateDecision] = field(default_factory=list)
+
+
+def safe_tokens(value: object) -> set[str]:
+    """Tokenize text with boundaries and drop weak tokens that cause false matches."""
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", str(value).casefold()):
+        if (
+            token in STOP_WORDS
+            or token in GENERIC_COLUMNS
+            or len(token) < 3
+            or re.fullmatch(r"(?:col|column)?\d+", token)
+        ):
+            continue
+        tokens.add(token)
+        if len(token) > 3 and token.endswith("s"):
+            tokens.add(token[:-1])
+        if len(token) > 4 and token.endswith("ed"):
+            tokens.add(token[:-1])
+            tokens.add(token[:-2])
+    return tokens
+
+
+def _organization_id(owner_id: int) -> str | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ? AND deleted_at IS NULL",
+            (owner_id,),
+        ).fetchone()
+    return str(row["organization_id"]) if row else None
+
+
+def _active_accessible_document(
+    owner_id: int,
+    document_id: int,
+    version_id: int | None = None,
+    project_id: str | None = None,
+    folder_id: str | None = None,
+) -> bool:
+    organization_id = _organization_id(owner_id)
+    if organization_id is None:
+        # Service-level unit tests may mock retrieval without creating auth rows.
+        # Public API calls still pass through get_current_user before this point.
+        return True
+    version_clause = "AND dv.id = ?" if version_id is not None else ""
+    params: list[object] = [
+        organization_id, owner_id, owner_id, document_id,
+        project_id, project_id, folder_id, folder_id,
+    ]
+    if version_id is not None:
+        params.append(version_id)
+    with get_connection() as connection:
+        return connection.execute(
+            f"""SELECT 1
+                FROM documents d
+                JOIN document_versions dv
+                  ON dv.id = d.current_version_id
+                 AND dv.document_id = d.id
+                 AND dv.organization_id = d.organization_id
+                WHERE {READABLE_DOCUMENT_SQL}
+                  AND d.id = ?
+                  AND (? IS NULL OR d.project_id = ?)
+                  AND (? IS NULL OR d.folder_id = ?)
+                  AND d.current_version_id IS NOT NULL
+                  AND d.processing_status = 'completed'
+                  AND dv.status = 'completed'
+                  AND dv.deleted_at IS NULL
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM chunks c
+                      WHERE c.organization_id = d.organization_id
+                        AND c.document_id = d.id
+                        AND c.version_id = dv.id
+                        AND c.deleted_at IS NULL
+                        AND (
+                            c.indexing_status = 'completed'
+                            OR c.vector_point_id IS NOT NULL
+                            OR c.embedding IS NOT NULL
+                        )
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM workbook_sheets ws
+                      WHERE ws.organization_id = d.organization_id
+                        AND ws.content_id = d.content_id
+                        AND ws.status = 'processed'
+                    )
+                  )
+                  {version_clause}
+                LIMIT 1""",
+            params,
+        ).fetchone() is not None
+
+
+def _confident_document_id_from_question(
+    question: str,
+    owner_id: int,
+    collection_id: int | None,
+    project_id: str | None = None,
+    folder_id: str | None = None,
+) -> int | None:
+    """Route named-document questions before broad semantic search can mix files."""
+    organization_id = _organization_id(owner_id)
+    if organization_id is None:
+        return None
+    question_tokens = safe_tokens(question)
+    if not question_tokens:
+        return None
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"""SELECT d.id, d.original_filename, d.display_filename
+                FROM documents d
+                JOIN document_versions dv
+                  ON dv.id = d.current_version_id
+                 AND dv.document_id = d.id
+                 AND dv.organization_id = d.organization_id
+                WHERE {READABLE_DOCUMENT_SQL}
+                  AND d.current_version_id IS NOT NULL
+                  AND d.processing_status = 'completed'
+                  AND dv.status = 'completed'
+                  AND dv.deleted_at IS NULL
+                  AND (? IS NULL OR d.collection_id = ?)
+                  AND (? IS NULL OR d.project_id = ?)
+                  AND (? IS NULL OR d.folder_id = ?)
+                ORDER BY d.id""",
+            (
+                organization_id, owner_id, owner_id,
+                collection_id, collection_id,
+                project_id, project_id,
+                folder_id, folder_id,
+            ),
+        ).fetchall()
+    scored: list[tuple[int, int]] = []
+    for row in rows:
+        name_tokens = safe_tokens(
+            f"{row['original_filename']} {row['display_filename']}"
+        )
+        overlap = question_tokens & name_tokens
+        if overlap:
+            scored.append((len(overlap) * 4, int(row["id"])))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    if scored[0][0] < 4:
+        return None
+    if len(scored) > 1 and scored[0][0] - scored[1][0] <= AMBIGUITY_MARGIN:
+        return None
+    return scored[0][1]
+
+
+def _semantic_decisions(question: str, sources: list[dict[str, object]]) -> list[CandidateDecision]:
+    question_tokens = safe_tokens(question)
+    grouped: dict[int, CandidateDecision] = {}
+    for source in sources:
+        document_id = int(source["document_id"])
+        decision = grouped.setdefault(
+            document_id,
+            CandidateDecision(
+                document_id=document_id,
+                source_type=str(source.get("source_type") or "text"),
+                score=0,
+            ),
+        )
+        source_tokens = safe_tokens(" ".join((
+            str(source.get("filename") or ""),
+            str(source.get("content") or ""),
+            str(source.get("source_location") or ""),
+        )))
+        overlap = question_tokens & source_tokens
+        semantic = float(source.get("score") or 0.0)
+        decision.semantic_score = max(decision.semantic_score, semantic)
+        if overlap:
+            decision.score += min(8, len(overlap) * 3)
+            decision.reasons.append("semantic_token_overlap")
+        if semantic >= settings.rag_min_score:
+            decision.score += 4
+            decision.reasons.append("semantic_score_high")
+        if source.get("source_type") not in {"excel", "csv"} and semantic >= 0.15:
+            decision.score += 2
+            decision.reasons.append("unstructured_candidate")
+    for decision in grouped.values():
+        if decision.score < MIN_RETRIEVAL_SCORE:
+            decision.rejection_reason = "insufficient_evidence"
+    return sorted(grouped.values(), key=lambda item: (-item.score, item.document_id))
+
+
+def _structured_decisions(
+    question: str,
+    owner_id: int,
+    collection_id: int | None,
+    document_id: int | None,
+) -> list[CandidateDecision]:
+    decisions: list[CandidateDecision] = []
+    explicit_scope = document_id is not None
+    for scope in _load_scopes(owner_id, collection_id, document_id):
+        plan = _plan_for_scope(scope, question, explicit_scope=explicit_scope)
+        employee_answer = _answer_employee_profiles(scope, question)
+        evidence_score, reasons = _source_evidence(scope, question)
+        score = evidence_score
+        if employee_answer is not None:
+            score += 6
+            reasons.append("valid_employee_profile_plan")
+        elif plan.intent != "unavailable":
+            score += 4
+            reasons.append("valid_structured_plan")
+        if plan.filters:
+            score += 2
+            reasons.append("validated_filter")
+        rejection = None
+        if employee_answer is not None:
+            rejection = None
+        elif plan.intent == "unavailable":
+            rejection = plan.rejection_reason or "schema_mismatch"
+        elif score < MIN_STRUCTURED_SCORE:
+            rejection = "insufficient_evidence"
+        filename = scope.filename.casefold()
+        source_type = "csv" if filename.endswith(".csv") else "pdf" if filename.endswith(".pdf") else "excel"
+        decisions.append(CandidateDecision(
+            document_id=scope.document_id,
+            source_type=source_type,
+            score=score,
+            schema_score=evidence_score,
+            reasons=sorted(set(reasons)),
+            rejection_reason=rejection,
+        ))
+    return sorted(decisions, key=lambda item: (-item.score, item.document_id))
+
+
+def _best_non_rejected(decisions: list[CandidateDecision]) -> CandidateDecision | None:
+    for decision in decisions:
+        if decision.rejection_reason is None:
+            return decision
+    return None
+
+
+def _has_validated_structured_filter(decision: CandidateDecision | None) -> bool:
+    """Treat an evidence-backed row filter as stronger than noisy text overlap."""
+    return (
+        decision is not None
+        and decision.score >= MIN_STRUCTURED_SCORE
+        and "validated_filter" in decision.reasons
+    )
+
+
+def select_sources(
+    *,
+    question: str,
+    owner_id: int,
+    collection_id: int | None = None,
+    document_id: int | None = None,
+    version_id: int | None = None,
+    structured_requested: bool = False,
+    searcher=search_chunks,
+    diagnostic: "RagRequestDiagnostic | None" = None,
+    project_id: str | None = None,
+    folder_id: str | None = None,
+) -> SelectionResult:
+    """Compare eligible structured and unstructured evidence before answering."""
+    if document_id is not None and not _active_accessible_document(
+        owner_id, document_id, version_id, project_id, folder_id
+    ):
+        return SelectionResult(path="unavailable", reason="acl_excluded")
+    routed_document_id = document_id
+    if routed_document_id is None and version_id is None:
+        routed_document_id = _confident_document_id_from_question(
+            question, owner_id, collection_id, project_id, folder_id
+        )
+    if routed_document_id is not None and version_id is None and structured_requested:
+        structured = _structured_decisions(question, owner_id, collection_id, routed_document_id)
+        best_structured = _best_non_rejected(structured)
+        log_event(
+            "rag.source_selection",
+            user_id=owner_id,
+            collection_id=collection_id,
+            explicit_document_id=document_id,
+            routed_document_id=routed_document_id,
+            candidates=[
+                {
+                    "document_id": item.document_id,
+                    "type": item.source_type,
+                    "score": item.score,
+                    "semantic_score": item.semantic_score,
+                    "schema_score": item.schema_score,
+                    "rejection_reason": item.rejection_reason,
+                    "reasons": item.reasons,
+                }
+                for item in structured
+            ],
+        )
+        if best_structured is not None:
+            return SelectionResult(
+                path="structured",
+                document_id=best_structured.document_id,
+                reason=(
+                    "explicit_structured_scope"
+                    if document_id is not None
+                    else "filename_routed_structured_scope"
+                ),
+                diagnostics=structured,
+            )
+
+    retrieval_limit = max(settings.rag_retrieval_limit, settings.rag_final_context_limit)
+    search_kwargs = {
+        "owner_id": owner_id,
+        "limit": retrieval_limit,
+        "collection_id": collection_id,
+        "document_id": routed_document_id,
+        "version_id": version_id,
+        "min_score": settings.rag_min_score,
+        "project_id": project_id,
+    }
+    if folder_id is not None:
+        search_kwargs["folder_id"] = folder_id
+    retrieval_sources = searcher(
+        question,
+        **search_kwargs,
+    )
+    if diagnostic is not None:
+        diagnostic.record_retrieval_attempt(
+            limit=retrieval_limit,
+            min_score=settings.rag_min_score,
+            sources=retrieval_sources,
+        )
+    semantic = _semantic_decisions(question, retrieval_sources)
+    if not _best_non_rejected(semantic) and (structured_requested or len(safe_tokens(question)) >= 2):
+        fallback_kwargs = {**search_kwargs, "min_score": 0.0}
+        fallback_sources = searcher(
+            question,
+            **fallback_kwargs,
+        )
+        if diagnostic is not None:
+            diagnostic.record_retrieval_attempt(
+                limit=retrieval_limit,
+                min_score=0.0,
+                sources=fallback_sources,
+            )
+        fallback_decisions = _semantic_decisions(question, fallback_sources)
+        if _best_non_rejected(fallback_decisions):
+            retrieval_sources = fallback_sources
+            semantic = fallback_decisions
+    structured = []
+    if version_id is None and project_id is None and folder_id is None:
+        structured = _structured_decisions(question, owner_id, collection_id, routed_document_id)
+    diagnostics = [*structured, *semantic]
+    best_structured = _best_non_rejected(structured)
+    best_semantic = _best_non_rejected(semantic)
+
+    log_event(
+        "rag.source_selection",
+        user_id=owner_id,
+        collection_id=collection_id,
+        explicit_document_id=document_id,
+        routed_document_id=routed_document_id,
+        candidates=[
+            {
+                "document_id": item.document_id,
+                "type": item.source_type,
+                "score": item.score,
+                "semantic_score": item.semantic_score,
+                "schema_score": item.schema_score,
+                "rejection_reason": item.rejection_reason,
+                "reasons": item.reasons,
+            }
+            for item in diagnostics
+        ],
+    )
+
+    valid = [item for item in diagnostics if item.rejection_reason is None]
+    if not valid:
+        return SelectionResult(path="unavailable", reason="insufficient_evidence", diagnostics=diagnostics)
+    if structured_requested and _has_validated_structured_filter(best_structured):
+        return SelectionResult(
+            path="structured",
+            document_id=best_structured.document_id,
+            reason="structured_filter_evidence",
+            diagnostics=diagnostics,
+        )
+    valid.sort(key=lambda item: (-item.score, item.document_id))
+    if (
+        len(valid) > 1
+        and valid[0].document_id != valid[1].document_id
+        and valid[0].score - valid[1].score <= AMBIGUITY_MARGIN
+    ):
+        return SelectionResult(path="clarification", reason="ambiguous_candidate", diagnostics=diagnostics)
+
+    if structured_requested and best_structured is not None:
+        if _has_validated_structured_filter(best_structured):
+            return SelectionResult(
+                path="structured",
+                document_id=best_structured.document_id,
+                reason="structured_filter_evidence",
+                diagnostics=diagnostics,
+            )
+        if best_semantic and best_semantic.document_id != best_structured.document_id and best_semantic.score > best_structured.score:
+            selected_sources = [
+                source for source in retrieval_sources
+                if int(source["document_id"]) == best_semantic.document_id
+            ]
+            return SelectionResult(
+                path="retrieval",
+                document_id=best_semantic.document_id,
+                sources=selected_sources,
+                reason="unstructured_evidence_stronger",
+                diagnostics=diagnostics,
+            )
+        return SelectionResult(
+            path="structured",
+            document_id=best_structured.document_id,
+            reason="structured_schema_evidence",
+            diagnostics=diagnostics,
+        )
+
+    selected = valid[0]
+    if selected.source_type in {"excel", "csv", "pdf"} and best_structured and selected.document_id == best_structured.document_id:
+        return SelectionResult(path="structured", document_id=selected.document_id, reason="structured_schema_evidence", diagnostics=diagnostics)
+    selected_sources = [
+        source for source in retrieval_sources
+        if int(source["document_id"]) == selected.document_id
+    ]
+    return SelectionResult(
+        path="retrieval",
+        document_id=selected.document_id,
+        sources=selected_sources,
+        reason="filename_routed_semantic_evidence" if routed_document_id is not None and document_id is None else "semantic_evidence",
+        diagnostics=diagnostics,
+    )
+
+
+def validate_grounded_result(
+    result: dict[str, object],
+    *,
+    selected_document_id: int | None,
+    owner_id: int,
+    final_context_sources: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Reject answers whose selected source, plan, and citations diverge."""
+    if not result.get("grounded"):
+        return _unavailable("unavailable_with_citations") if result.get("sources") else result
+    sources = [source for source in (result.get("sources") or []) if isinstance(source, dict)]
+    if selected_document_id is None or not sources:
+        return _unavailable("missing_citation")
+    for source in sources:
+        if int(source.get("document_id") or 0) != selected_document_id:
+            return _unavailable("citation_document_mismatch")
+        if source.get("version_id") is None:
+            return _unavailable("citation_version_missing")
+        if not _active_accessible_document(
+            owner_id,
+            selected_document_id,
+            int(source["version_id"]),
+        ):
+            return _unavailable("source_no_longer_accessible")
+    if final_context_sources is not None and not _citations_match_final_context(
+        sources, final_context_sources
+    ):
+        return _unavailable("citation_not_in_final_context")
+    context = result.get("_context")
+    if isinstance(context, dict):
+        context_docs = {int(value) for value in context.get("document_ids") or []}
+        if context_docs and context_docs != {selected_document_id}:
+            return _unavailable("result_plan_document_mismatch")
+    provenance = result.get("provenance")
+    if isinstance(provenance, dict) and not _provenance_matches_sources(provenance, sources, selected_document_id):
+        return _unavailable("result_plan_source_mismatch")
+    if isinstance(context, dict):
+        result_plan = context.get("result_plan")
+        if isinstance(result_plan, dict) and result_plan != provenance:
+            return _unavailable("result_plan_provenance_mismatch")
+    return result
+
+
+def _citations_match_final_context(
+    citations: list[dict[str, object]],
+    final_context_sources: list[dict[str, object]],
+) -> bool:
+    """Require retrieval citations to identify chunks that actually reached the model."""
+    for citation in citations:
+        if not any(
+            int(citation.get("document_id") or 0) == int(source.get("document_id") or 0)
+            and int(citation.get("version_id") or 0) == int(source.get("version_id") or 0)
+            and str(citation.get("filename") or "") == str(source.get("filename") or "")
+            and str(citation.get("source_type") or "text") == str(source.get("source_type") or "text")
+            and citation.get("source_location") == source.get("source_location")
+            and str(citation.get("text") or "") == str(source.get("content") or "")
+            for source in final_context_sources
+        ):
+            return False
+    return True
+
+
+def _provenance_matches_sources(
+    provenance: dict[str, object],
+    sources: list[dict[str, object]],
+    selected_document_id: int,
+) -> bool:
+    """Require compact structured provenance to stay within cited document ranges."""
+    if int(provenance.get("document_id") or 0) != selected_document_id:
+        return False
+    version_id = provenance.get("version_id")
+    if version_id is None or any(int(source.get("version_id") or 0) != int(version_id) for source in sources):
+        return False
+    by_sheet = {
+        str((source.get("source_location") or {}).get("sheet_name") or ""): source
+        for source in sources
+    }
+    sheets = provenance.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        return False
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            return False
+        source = by_sheet.get(str(sheet.get("sheet_name") or ""))
+        if source is None:
+            return False
+        source_ranges = (source.get("source_location") or {}).get("row_ranges") or []
+        for row_range in sheet.get("row_ranges") or []:
+            if not isinstance(row_range, dict) or not any(
+                int(source_range.get("row_start") or 0) <= int(row_range.get("row_start") or 0)
+                and int(row_range.get("row_end") or 0) <= int(source_range.get("row_end") or 0)
+                for source_range in source_ranges
+                if isinstance(source_range, dict)
+            ):
+                return False
+    return True
+
+
+def _unavailable(reason: str) -> dict[str, object]:
+    return {
+        "answer": UNAVAILABLE_ANSWER,
+        "question_type": "source_selection",
+        "grounded": False,
+        "sources": [],
+        "unavailable_reason": reason,
+    }

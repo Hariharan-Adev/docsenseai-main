@@ -1,0 +1,48 @@
+.env
+.env.local
+
+# Python
+backend/.env
+backend/venv/
+backend/.venv312/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data
+*.log
+*.err.log
+backend/data/*.db
+backend/data/*.db.*.bak
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+backend/data/*.log
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+backend/data/qdrant/
+backend/qdrant_data/
+backend/.test-tmp/
+
+# Node/Vite
+node_modules/
+.vite/
+backend/node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.docx_review/
+*.tsbuildinfo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
