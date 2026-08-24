@@ -1,5 +1,5 @@
 import { Building2, ChevronLeft, ChevronRight, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
@@ -47,8 +47,14 @@ const initialGitHubConfiguration: GitHubConfiguration = {
   incrementalSync: true,
 }
 
-// Renders the integration navigation and the currently selected Azure Dev configuration form.
-export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
+type ConfigurationPageProps = {
+  onBack: () => void
+  onNavigate: (integrationId: string | null) => void
+  routeIntegrationId?: string
+}
+
+// Renders integration configuration while keeping its selection synchronized with the URL.
+export default function ConfigurationPage({ onBack, onNavigate, routeIntegrationId }: ConfigurationPageProps) {
   const { showToast } = useApp()
   const [selectedIntegration, setSelectedIntegration] = useState<'azure-dev' | 'catalog' | 'github' | null>(null)
   const [integrationSearch, setIntegrationSearch] = useState('')
@@ -73,6 +79,17 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
   const [azureDevDeleted, setAzureDevDeleted] = useState(false)
   const [integrationMenuId, setIntegrationMenuId] = useState<'azure-dev' | 'github' | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<{ integrationId: 'azure-dev' | 'github'; action: 'disconnect' | 'reconnect' | 'delete' } | null>(null)
+
+  useEffect(() => {
+    const routeSelection = routeIntegrationId === 'azure-dev' || routeIntegrationId === 'github' || routeIntegrationId === 'catalog' ? routeIntegrationId : null
+    setSelectedIntegration(routeSelection)
+  }, [routeIntegrationId])
+
+  // Updates both local rendering state and browser history for user-driven selections.
+  const selectIntegration = (integrationId: 'azure-dev' | 'catalog' | 'github' | null) => {
+    setSelectedIntegration(integrationId)
+    onNavigate(integrationId)
+  }
 
   // Keeps backend-dependent controls honest until an Azure Dev API is available.
   const backendUnavailable = () => showToast('Azure Dev backend integration is not configured')
@@ -107,7 +124,7 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
   const openGitHubConfiguration = () => {
     setGitHubDraft({ ...(savedGitHubConfiguration ?? initialGitHubConfiguration) })
     setShowGitHubToken(false)
-    setSelectedIntegration('github')
+    selectIntegration('github')
   }
 
   // Keeps connection status tied to the exact credentials that were tested.
@@ -161,9 +178,9 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
   const handleIntegrationRowOpen = (id: 'azure-dev' | 'github') => {
     setIntegrationMenuId(null)
     if (selectedIntegration === id) {
-      setSelectedIntegration(null)
+      selectIntegration(null)
     } else {
-      if (id === 'azure-dev') setSelectedIntegration('azure-dev')
+      if (id === 'azure-dev') selectIntegration('azure-dev')
       else openGitHubConfiguration()
     }
   }
@@ -195,12 +212,12 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
     if (pendingConfirmation.action === 'delete') {
       if (pendingConfirmation.integrationId === 'azure-dev') {
         setAzureDevDeleted(true)
-        setSelectedIntegration(current => current === 'azure-dev' ? 'catalog' : current)
+        if (selectedIntegration === 'azure-dev') selectIntegration('catalog')
         cancelAzureChanges()
       } else {
         setSavedGitHubConfiguration(null)
         setGitHubDraft({ ...initialGitHubConfiguration })
-        setSelectedIntegration(current => current === 'github' ? 'catalog' : current)
+        if (selectedIntegration === 'github') selectIntegration('catalog')
         setShowGitHubToken(false)
       }
     }
@@ -210,7 +227,7 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
 
   // Routes catalog actions while leaving integrations without forms in the gallery.
   const configureIntegration = (id: typeof integrationCatalog[number]['id']) => {
-    if (id === 'azure-dev') setSelectedIntegration('azure-dev')
+    if (id === 'azure-dev') selectIntegration('azure-dev')
     else if (id === 'github') openGitHubConfiguration()
     else showToast(`${integrationCatalog.find(item => item.id === id)?.name} configuration is not available yet`)
   }
@@ -259,7 +276,7 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
             <button type="button" onClick={event => { event.stopPropagation(); handleMenuAction('github', 'delete') }} className="flex w-full items-center rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-red-600 hover:bg-red-50">Delete Configuration</button>
           </div>}
         </div>}
-        <button type="button" onClick={() => setSelectedIntegration(current => current === 'catalog' ? null : 'catalog')} aria-current={selectedIntegration === 'catalog' ? 'page' : undefined} className={`mt-1 flex h-10 w-full items-center gap-2.5 rounded-xl px-3 text-left text-[12px] font-semibold ${selectedIntegration === 'catalog' ? 'bg-[#eef4ff] text-blue-600' : 'text-slate-600 hover:bg-slate-50 hover:text-blue-600'}`}><Plus size={16} />Add Integration</button>
+        <button type="button" onClick={() => selectIntegration(selectedIntegration === 'catalog' ? null : 'catalog')} aria-current={selectedIntegration === 'catalog' ? 'page' : undefined} className={`mt-1 flex h-10 w-full items-center gap-2.5 rounded-xl px-3 text-left text-[12px] font-semibold ${selectedIntegration === 'catalog' ? 'bg-[#eef4ff] text-blue-600' : 'text-slate-600 hover:bg-slate-50 hover:text-blue-600'}`}><Plus size={16} />Add Integration</button>
       </nav>
     </aside>
 
@@ -501,7 +518,7 @@ export default function ConfigurationPage({ onBack }: { onBack: () => void }) {
         <Card className="my-4 border-[#e6ecf5] p-4 shadow-[0_5px_18px_rgba(37,99,235,.04)]">
           <h3 className="text-sm font-semibold text-slate-900">Actions</h3>
           <div className="mt-4 flex justify-end gap-2">
-            <Button type="button" variant="secondary" disabled={savingGitHubConfiguration} onClick={() => { setGitHubDraft({ ...(savedGitHubConfiguration ?? initialGitHubConfiguration) }); setSelectedIntegration('catalog') }}>Cancel</Button>
+            <Button type="button" variant="secondary" disabled={savingGitHubConfiguration} onClick={() => { setGitHubDraft({ ...(savedGitHubConfiguration ?? initialGitHubConfiguration) }); selectIntegration('catalog') }}>Cancel</Button>
             <Button type="button" disabled={savingGitHubConfiguration} onClick={handleSaveGitHubConfiguration}>{savingGitHubConfiguration ? 'Saving...' : 'Save & Sync'}</Button>
           </div>
         </Card>

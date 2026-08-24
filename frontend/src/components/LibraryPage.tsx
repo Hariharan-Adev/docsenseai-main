@@ -1,8 +1,11 @@
 import { Archive, Check, ChevronDown, Edit2, FileText, FolderOpen, Menu, Plus, Search, Trash2, Upload, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
 import type { PolicyDocument } from '../types'
 import DocumentDeleteModal from './DocumentDeleteModal'
+import { Button } from './ui/Button'
+import { Modal } from './ui/Modal'
 
 function relativeDate(value: string) {
   const date = new Date(value)
@@ -20,8 +23,8 @@ function relativeDate(value: string) {
 
 export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
   const { documents, collections, projects, folders, selectedProjectId, setSelectedProjectId, selectedFolderId, setSelectedFolderId, selectedCollectionId, setSelectedCollectionId, setSelectedDocument, createFolder, renameFolder, deleteFolder, removeDocument, setSidebarOpen, showToast } = useApp()
+  const navigate = useNavigate()
   const [search, setSearch] = useState('')
-  const [tab, setTab] = useState<'chats' | 'documents'>('documents')
   const [newFolderName, setNewFolderName] = useState('')
   const [creatingFolder, setCreatingFolder] = useState(false)
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null)
@@ -203,17 +206,13 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
             <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input id="library-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Search documents" className="h-10 w-64 rounded-xl border border-[#e6ecf5] bg-white pl-9 pr-3 text-[12px] outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60" />
           </div>
-          <NewMenu onUpload={onUpload} />
+          <button type="button" onClick={onUpload} className="flex h-10 shrink-0 items-center gap-2 rounded-xl bg-blue-600 px-4 text-[12px] font-semibold text-white shadow-[0_5px_16px_rgba(37,99,235,.22)] hover:bg-blue-700"><Upload size={16} />Upload</button>
         </div>
       </div>
 
-      {activeProject && <div className="mb-5 flex items-center gap-1 border-b border-[#e6ecf5]">
-        {(['chats', 'documents'] as const).map(value => <button key={value} type="button" onClick={() => setTab(value)} className={`relative px-4 py-2.5 text-[12px] font-semibold capitalize ${tab === value ? 'text-blue-600 after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-blue-600' : 'text-slate-500 hover:text-slate-900'}`}>{value}</button>)}
-      </div>}
-
       {!activeProject && (projects.length > 0 || collections.length > 0) && <div className="mb-4 flex gap-2 overflow-x-auto pb-1">
-        <button type="button" onClick={() => { setSelectedProjectId(null); setSelectedFolderId(null); setSelectedCollectionId(null) }} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedProjectId === null && selectedCollectionId === null ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />All documents</button>
-        {projects.map(project => <button key={project.id} type="button" onClick={() => { setSelectedProjectId(project.id); setSelectedFolderId(null); setSelectedCollectionId(null) }} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedProjectId === project.id && selectedFolderId === null ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />{project.name}</button>)}
+        <button type="button" onClick={() => navigate('/documents')} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedProjectId === null && selectedCollectionId === null ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />All documents</button>
+        {projects.map(project => <button key={project.id} type="button" onClick={() => navigate(`/projects/${encodeURIComponent(project.id)}`)} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedProjectId === project.id && selectedFolderId === null ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />{project.name}</button>)}
         {collections.map(collection => <button key={collection.id} type="button" onClick={() => setSelectedCollectionId(collection.id)} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedCollectionId === collection.id ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />{collection.name}<span className="text-[10px] text-slate-400">{collection.document_count ?? 0}</span></button>)}
       </div>}
 
@@ -225,18 +224,13 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
           </div>
           <button type="button" onClick={() => setCreatingFolder(true)} className="flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-slate-600 hover:border-blue-200 hover:text-blue-600"><Plus size={14} />New Folder</button>
         </div>
-        {creatingFolder && <div className="mb-3 flex gap-2 rounded-lg border border-blue-100 bg-blue-50/50 p-2">
-          <input value={newFolderName} onChange={event => setNewFolderName(event.target.value)} className="field h-8 min-w-0 flex-1" placeholder="Folder name" autoFocus />
-          <button type="button" onClick={() => void saveNewFolder()} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-blue-600 text-white" aria-label="Save folder"><Check size={15} /></button>
-          <button type="button" onClick={() => { setCreatingFolder(false); setNewFolderName('') }} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-500 hover:bg-slate-100" aria-label="Cancel folder"><X size={15} /></button>
-        </div>}
         {folders.length > 0 ? <div>
           <div className="hidden grid-cols-[minmax(0,1fr)_110px_120px_44px] gap-4 border-b border-slate-200 px-3 py-2 text-[10px] font-semibold uppercase tracking-[.08em] text-slate-400 sm:grid">
             <span>Name</span><span>Documents</span><span>Modified</span><span />
           </div>
           <div className="space-y-1">
             {folders.map(folder => <div key={folder.id} className={`group relative grid grid-cols-[minmax(0,1fr)_44px] items-center gap-2 rounded-lg border px-3 py-2.5 text-[12px] sm:grid-cols-[minmax(0,1fr)_110px_120px_44px] sm:gap-4 ${selectedFolderId === folder.id ? 'border-blue-200 bg-blue-50' : 'border-slate-200 bg-white hover:border-slate-300'}`}>
-              {editingFolderId === folder.id ? <input value={editingFolderName} onChange={event => setEditingFolderName(event.target.value)} className="field h-8 min-w-0" autoFocus /> : <button type="button" onClick={() => setSelectedFolderId(folder.id)} className="flex min-w-0 items-center gap-2 text-left font-semibold text-slate-900 hover:text-blue-600">
+              {editingFolderId === folder.id ? <input value={editingFolderName} onChange={event => setEditingFolderName(event.target.value)} className="field h-8 min-w-0" autoFocus /> : <button type="button" onClick={() => navigate(`/projects/${encodeURIComponent(activeProject.id)}/folders/${encodeURIComponent(folder.id)}`)} className="flex min-w-0 items-center gap-2 text-left font-semibold text-slate-900 hover:text-blue-600">
                 <FolderOpen size={15} className="shrink-0 text-slate-400" />
                 <span className="truncate">{folder.name}</span>
               </button>}
@@ -267,7 +261,7 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
 
       <div className="mb-4 flex gap-2 sm:hidden">
         <div className="relative min-w-0 flex-1"><Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" /><input id="library-search-mobile" value={search} onChange={event => setSearch(event.target.value)} placeholder="Search documents" className="h-10 w-full rounded-xl border border-[#e6ecf5] bg-white pl-9 pr-3 text-[12px] outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60" /></div>
-        <NewMenu onUpload={onUpload} />
+        <button type="button" onClick={onUpload} className="flex h-10 shrink-0 items-center gap-2 rounded-xl bg-blue-600 px-4 text-[12px] font-semibold text-white shadow-[0_5px_16px_rgba(37,99,235,.22)] hover:bg-blue-700"><Upload size={16} />Upload</button>
       </div>
 
       <section>
@@ -334,25 +328,16 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
           </div>
         </div>
       </div>}
+      <Modal open={creatingFolder} onClose={() => { setCreatingFolder(false); setNewFolderName('') }} title="Create new folder">
+        <form onSubmit={event => { event.preventDefault(); void saveNewFolder() }}>
+          <input value={newFolderName} onChange={event => setNewFolderName(event.target.value)} className="field h-10 w-full" placeholder="Folder name" autoFocus />
+          <div className="mt-5 flex justify-end gap-2">
+            <Button type="button" variant="secondary" size="sm" onClick={() => { setCreatingFolder(false); setNewFolderName('') }}>Cancel</Button>
+            <Button type="submit" size="sm" disabled={!newFolderName.trim()}>Create</Button>
+          </div>
+        </form>
+      </Modal>
     </div>
     <DocumentDeleteModal open={documentToDelete !== null || bulkDeleteOpen} documentName={documentToDelete?.name ?? ''} documentCount={bulkDeleteOpen ? selectedVisibleCount : undefined} isDeleting={isDeleting} error={deleteError} onCancel={cancelDelete} onConfirm={() => void confirmDelete()} />
   </section>
-}
-
-function NewMenu({ onUpload }: { onUpload: () => void }) {
-  const [open, setOpen] = useState(false)
-  const menuRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!open) return
-    const outside = (event: PointerEvent) => { if (!menuRef.current?.contains(event.target as Node)) setOpen(false) }
-    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setOpen(false) }
-    document.addEventListener('pointerdown', outside)
-    document.addEventListener('keydown', escape)
-    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape) }
-  }, [open])
-
-  return <div ref={menuRef} className="relative shrink-0">
-    <button type="button" onClick={() => setOpen(!open)} aria-haspopup="menu" aria-expanded={open} className="flex h-10 items-center gap-2 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-500 px-4 text-[12px] font-semibold text-white shadow-[0_5px_16px_rgba(37,99,235,.22)] hover:-translate-y-0.5"><Plus size={16} />New<ChevronDown size={13} /></button>
-    {open && <div role="menu" className="absolute right-0 top-12 z-40 w-48 rounded-[14px] border border-[#e6ecf5] bg-white p-1.5 shadow-[0_10px_30px_rgba(15,23,42,.12)]"><button type="button" role="menuitem" onClick={() => { setOpen(false); onUpload() }} className="flex h-[42px] w-full items-center gap-2.5 rounded-[9px] px-3 text-left text-[12px] font-medium text-slate-600 hover:bg-[#f3f7ff] hover:text-blue-600"><Upload size={16} />Upload</button></div>}
-  </div>
 }

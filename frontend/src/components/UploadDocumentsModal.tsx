@@ -124,9 +124,19 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
     event.target.value = ''
   }
 
+  // Clears transient upload state before dismissing a completed modal.
+  const resetAndClose = () => {
+    setItems([])
+    setFolderName('')
+    setBatchId(null)
+    onClose()
+  }
+
   const runUploads = async (targets: UploadItem[], includeSkipped = true) => {
     if (!targets.length || uploading) return
     const batchItems = includeSkipped ? items : targets
+    const targetIds = new Set(targets.map(item => item.id))
+    let hasFailures = items.some(item => !targetIds.has(item.id) && (item.status === 'failed' || item.status === 'cancelled' || Boolean(item.archiveResult?.summary.failed)))
     const totalBytes = batchItems.reduce((total, item) => total + item.file.size, 0)
     if (mode === 'folder' && items.length > config.max_folder_files) {
       showToast(`A folder may contain at most ${config.max_folder_files} files.`)
@@ -178,6 +188,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
                 signal: controller.signal,
                 idempotencyKey: `archive:${item.idempotencyKey}`,
               })
+              if (archiveResult.summary.failed > 0) hasFailures = true
               setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', archiveResult } : current))
             } else {
               const result = await uploadDocument(item.file, {
@@ -190,6 +201,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
             }
           } catch (error) {
             const aborted = error instanceof DOMException && error.name === 'AbortError'
+            if (aborted || !(error instanceof ApiError && error.status === 409)) hasFailures = true
             const message = error instanceof ApiError ? error.message : aborted ? 'Cancelled' : error instanceof Error ? error.message : 'Upload failed.'
             setItems(previous => previous.map(current => current.id === item.id ? {
               ...current,
@@ -205,6 +217,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
       }
       await Promise.all(Array.from({ length: Math.min(config.max_concurrent_uploads, targets.length) }, () => worker()))
       await refreshDocuments()
+      if (!hasFailures && !cancelledRef.current) resetAndClose()
     } catch (error) {
       showToast(error instanceof Error ? error.message : 'Folder upload could not be started.')
     } finally {
@@ -222,10 +235,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
 
   const close = () => {
     if (uploading) return
-    setItems([])
-    setFolderName('')
-    setBatchId(null)
-    onClose()
+    resetAndClose()
   }
 
   const retryFailed = () => {

@@ -1,6 +1,7 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { MessageSquare, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
 import { useMemo, useState, type KeyboardEvent, type MouseEvent } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
 import type { Conversation } from '../types'
 import { cn } from '../utils/cn'
@@ -27,6 +28,7 @@ export default function ChatHistory() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null)
+  const navigate = useNavigate()
 
   const groups = useMemo(() => {
     const sorted = [...conversations].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
@@ -101,7 +103,7 @@ export default function ChatHistory() {
         ) : (
           <button
             type="button"
-            onClick={() => selectConversation(conversation.id)}
+            onClick={() => { selectConversation(conversation.id); navigate('/chat') }}
             aria-current={active ? 'page' : undefined}
             aria-pressed={active}
             className="flex min-w-0 flex-1 items-center gap-2 self-stretch text-left text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-blue-500/35"

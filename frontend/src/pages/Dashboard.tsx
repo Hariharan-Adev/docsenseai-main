@@ -1,6 +1,7 @@
 import { Keyboard } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
+import { matchPath, useLocation, useNavigate } from 'react-router-dom'
 import BookmarksModal from '../components/BookmarksModal'
 import ChatArea from '../components/ChatArea'
 import ConfigurationPage from '../components/ConfigurationPage'
@@ -30,13 +31,41 @@ function toastColor(message: string) {
   return 'bg-gradient-to-br from-blue-600 to-indigo-500 shadow-[0_10px_30px_rgba(37,99,235,.28)]'
 }
 
+// Converts supported browser URLs into the existing dashboard selection state.
+function dashboardRoute(pathname: string) {
+  const folder = matchPath('/projects/:projectId/folders/:folderId', pathname)
+  if (folder) return { view: 'project' as const, projectId: folder.params.projectId ?? null, folderId: folder.params.folderId ?? null }
+  const project = matchPath('/projects/:projectId', pathname)
+  if (project) return { view: 'project' as const, projectId: project.params.projectId ?? null, folderId: null }
+  if (pathname === '/projects') return { view: 'projects' as const, projectId: null, folderId: null }
+  if (pathname === '/documents') return { view: 'library' as const, projectId: null, folderId: null }
+  if (pathname === '/configuration' || matchPath('/configuration/:integrationId', pathname)) return { view: 'configuration' as const }
+  if (pathname === '/' || pathname === '/chat') return { view: 'chat' as const }
+  return null
+}
+
 export default function Dashboard(){
   const {setSidebarOpen,setView,setSelectedProjectId,setSelectedFolderId,setSelectedCollectionId,setSelectedDocument,view,toast,newChat}=useApp()
+  const location=useLocation()
+  const navigate=useNavigate()
   const [upload,setUpload]=useState(false)
   const [settings,setSettings]=useState(false)
   const [help,setHelp]=useState(false)
   const [bookmarks,setBookmarks]=useState(false)
-  const previousViewRef=useRef(view)
+
+  useEffect(()=>{
+    const route=dashboardRoute(location.pathname)
+    if(!route)return
+    setHelp(false)
+    setSettings(false)
+    setView(route.view)
+    if('projectId' in route){
+      setSelectedProjectId(route.projectId ?? null)
+      setSelectedFolderId(route.folderId ?? null)
+      setSelectedCollectionId(null)
+      setSelectedDocument(null)
+    }
+  },[location.pathname,setSelectedCollectionId,setSelectedDocument,setSelectedFolderId,setSelectedProjectId,setView])
 
   useEffect(()=>{
     const shortcut=(event:KeyboardEvent)=>{
@@ -51,7 +80,7 @@ export default function Dashboard(){
 
   return <MainLayout>
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{duration:.3}} className="flex min-w-0 flex-1">
-      <Sidebar onClose={()=>setSidebarOpen(false)} onUpload={()=>{setSelectedProjectId(null);setSelectedFolderId(null);setSelectedCollectionId(null);setSelectedDocument(null);setView('library')}} onSettings={()=>{setHelp(false);if(view==='configuration')setView('dashboard');setSettings(true)}} onConfiguration={()=>{setHelp(false);setSettings(false);if(view!=='configuration')previousViewRef.current=view;setView('configuration')}} onHelp={()=>{setSettings(false);setHelp(true)}}/>
+      <Sidebar onClose={()=>setSidebarOpen(false)} onNewChat={()=>{newChat();navigate('/chat')}} onUpload={()=>navigate('/documents')} onProjects={()=>navigate('/projects')} onSettings={()=>{setHelp(false);if(view==='configuration')setView('dashboard');setSettings(true)}} onConfiguration={()=>{setHelp(false);setSettings(false);navigate('/configuration')}} onHelp={()=>{setSettings(false);setHelp(true)}}/>
       {help?<div className="h-screen min-w-0 flex-1 overflow-y-auto bg-[#f8faff] p-6">
         <div className="mx-auto max-w-4xl">
           <h1 className="mb-6 text-xl font-semibold text-slate-900">Help &amp; keyboard shortcuts</h1>
@@ -59,7 +88,7 @@ export default function Dashboard(){
           <div className="mt-4 space-y-2">{[['Ctrl + K','Focus policy search'],['Ctrl + N','Start a new chat'],['Ctrl + /','Open help'],['Esc','Close the active modal'],['Enter','Send a question'],['Shift + Enter','Add a new line']].map(([keys,label])=><div key={keys} className="flex items-center justify-between rounded-xl border border-[#eef2f7] bg-white p-3 shadow-[0_3px_12px_rgba(37,99,235,.03)]"><span className="text-xs text-slate-600">{label}</span><kbd className="rounded-md border border-blue-100 bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-600">{keys}</kbd></div>)}</div>
           <Button className="mt-5 w-full" onClick={()=>setHelp(false)}>Got it</Button>
         </div>
-      </div>:settings?<SettingsModal open onClose={()=>setSettings(false)}/>:view==='library'||view==='project'?<LibraryPage onUpload={()=>setUpload(true)}/>:view==='projects'?<ProjectsPage/>:view==='chat'?<ChatArea onUpload={()=>setUpload(true)}/>:view==='configuration'?<ConfigurationPage onBack={()=>setView(previousViewRef.current)}/>:<DashboardAnalytics/>}
+      </div>:settings?<SettingsModal open onClose={()=>setSettings(false)}/>:view==='library'||view==='project'?<LibraryPage onUpload={()=>setUpload(true)}/>:view==='projects'?<ProjectsPage/>:view==='chat'?<ChatArea onUpload={()=>setUpload(true)}/>:view==='configuration'?<ConfigurationPage routeIntegrationId={matchPath('/configuration/:integrationId',location.pathname)?.params.integrationId} onNavigate={integrationId=>navigate(integrationId?`/configuration/${integrationId}`:'/configuration')} onBack={()=>navigate(-1)}/>:<DashboardAnalytics/>}
     </motion.div>
     <UploadDocumentsModal open={upload} onClose={()=>setUpload(false)}/>
     <BookmarksModal open={bookmarks} onClose={()=>setBookmarks(false)}/>

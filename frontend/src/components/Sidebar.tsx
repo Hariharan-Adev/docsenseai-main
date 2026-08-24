@@ -9,22 +9,24 @@ import { Button } from './ui/Button'
 
 type SidebarProps = {
   onClose: () => void
+  onNewChat: () => void
   onUpload: () => void
+  onProjects: () => void
   onSettings: () => void
   onConfiguration: () => void
   onHelp: () => void
 }
 
-export default function Sidebar({ onClose, onUpload, onSettings, onConfiguration, onHelp }: SidebarProps) {
-  const { sidebarOpen, newChat, activeConversationId, view, setView, user, logout } = useApp()
+export default function Sidebar({ onClose, onNewChat, onUpload, onProjects, onSettings, onConfiguration, onHelp }: SidebarProps) {
+  const { sidebarOpen, activeConversationId, view, user, logout } = useApp()
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const profileRef = useRef<HTMLButtonElement>(null)
   const email = user.id
   const displayName = email.split('@')[0].split(/[._-]/).filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ') || 'User'
   const nav = [
-    { label: 'New Chat', icon: MessageSquarePlus, onClick: newChat, active: view === 'chat' && activeConversationId === null },
+    { label: 'New Chat', icon: MessageSquarePlus, onClick: onNewChat, active: view === 'chat' && activeConversationId === null },
     { label: 'Documents', icon: FileUp, onClick: onUpload, active: view === 'library' },
-    { label: 'Projects', icon: FolderKanban, onClick: () => setView('projects'), active: view === 'projects' || view === 'project' },
+    { label: 'Projects', icon: FolderKanban, onClick: onProjects, active: view === 'projects' || view === 'project' },
   ]
 
   return (

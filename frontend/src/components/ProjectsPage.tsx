@@ -1,5 +1,6 @@
 import { FolderKanban, Menu, MoreHorizontal, Pin, Plus, Search, Settings, Share2, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState, type FormEvent, type MouseEvent } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
 import { deleteProject as deleteProjectApi, type ProjectRecord } from '../services/api'
 import { Button } from './ui/Button'
@@ -15,7 +16,8 @@ function projectUpdatedAt(value: string) {
 
 // The projects index keeps unsupported project-management actions local and explicit.
 export default function ProjectsPage() {
-  const { projects, createProject, selectedProjectId, setSelectedProjectId, setSelectedFolderId, setSelectedCollectionId, setSelectedDocument, setSidebarOpen, setView, showToast } = useApp()
+  const { projects, createProject, selectedProjectId, setSelectedProjectId, setSelectedFolderId, setSelectedCollectionId, setSelectedDocument, setSidebarOpen, showToast } = useApp()
+  const navigate = useNavigate()
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<ProjectFilter>('all')
   const [createOpen, setCreateOpen] = useState(false)
@@ -56,7 +58,7 @@ export default function ProjectsPage() {
     setSelectedCollectionId(null)
     setSelectedDocument(null)
     setActionsProjectId(null)
-    setView('project')
+    navigate(`/projects/${encodeURIComponent(projectId)}`)
   }
 
   // Create through the existing context API, then follow the established open flow.
@@ -125,7 +127,7 @@ export default function ProjectsPage() {
         setSelectedFolderId(null)
         setSelectedCollectionId(null)
         setSelectedDocument(null)
-        setView('projects')
+        navigate('/projects')
       }
       showToast('Project deleted.')
     } catch (error) {
