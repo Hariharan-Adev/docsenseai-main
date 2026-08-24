@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from db.database import initialize_database
 from app.routes.auth import router as auth_router
+from app.routes.azure_devops import router as azure_devops_router
 from app.routes.chat import router as chat_router
 from app.routes.collections import router as collections_router
 from app.routes.documents import router as documents_router
@@ -66,6 +67,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+app.include_router(azure_devops_router)
 app.include_router(public_ingestion_router)
 app.include_router(upload_router)
 app.include_router(documents_router)

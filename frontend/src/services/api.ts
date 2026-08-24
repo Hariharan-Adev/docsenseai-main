@@ -70,6 +70,18 @@ export interface ProjectRecord {
   updated_at: string
 }
 
+export interface AzureDevOpsProject {
+  id: string
+  name: string
+}
+
+export interface AzureDevOpsTestResponse {
+  connected: boolean
+  organization_url: string
+  projects: AzureDevOpsProject[]
+  checks: string[]
+}
+
 export interface FolderRecord {
   id: string
   name: string
@@ -499,6 +511,14 @@ export async function listCollections() {
 
 export async function listProjects() {
   return requestJson<{ projects: ProjectRecord[] }>('/projects', { method: 'GET', headers: authHeaders() })
+}
+
+export async function testAzureDevOpsConnection(organizationUrl: string, personalAccessToken: string) {
+  return requestJson<AzureDevOpsTestResponse>('/integrations/azure-devops/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ organization_url: organizationUrl, personal_access_token: personalAccessToken }),
+  })
 }
 
 export async function createProject(name: string, description?: string) {

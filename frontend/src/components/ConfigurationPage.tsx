@@ -1,6 +1,7 @@
 import { Building2, ChevronLeft, ChevronRight, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
+import { ApiError, testAzureDevOpsConnection, type AzureDevOpsProject } from '../services/api'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
 
@@ -75,15 +76,34 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [showGitHubToken, setShowGitHubToken] = useState(false)
   const [testingGitHubConnection, setTestingGitHubConnection] = useState(false)
   const [savingGitHubConfiguration, setSavingGitHubConfiguration] = useState(false)
-  const [azureDevConnected, setAzureDevConnected] = useState(true)
+  const [testingAzureDevConnection, setTestingAzureDevConnection] = useState(false)
+  const [azureDevConnected, setAzureDevConnected] = useState(false)
+  const [azureDevProjects, setAzureDevProjects] = useState<AzureDevOpsProject[]>([])
+  const [azureDevConnectionMessage, setAzureDevConnectionMessage] = useState('Use Test Connection to verify the current credentials.')
   const [azureDevDeleted, setAzureDevDeleted] = useState(false)
   const [integrationMenuId, setIntegrationMenuId] = useState<'azure-dev' | 'github' | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<{ integrationId: 'azure-dev' | 'github'; action: 'disconnect' | 'reconnect' | 'delete' } | null>(null)
+  const integrationMenuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const routeSelection = routeIntegrationId === 'azure-dev' || routeIntegrationId === 'github' || routeIntegrationId === 'catalog' ? routeIntegrationId : null
     setSelectedIntegration(routeSelection)
   }, [routeIntegrationId])
+
+  useEffect(() => {
+    if (!integrationMenuId) return
+
+    // Close an open 3-dot menu from outside clicks while preserving menu item clicks.
+    const closeMenuFromOutsideClick = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && !integrationMenuRef.current?.contains(target)) {
+        setIntegrationMenuId(null)
+      }
+    }
+
+    document.addEventListener('pointerdown', closeMenuFromOutsideClick)
+    return () => document.removeEventListener('pointerdown', closeMenuFromOutsideClick)
+  }, [integrationMenuId])
 
   // Updates both local rendering state and browser history for user-driven selections.
   const selectIntegration = (integrationId: 'azure-dev' | 'catalog' | 'github' | null) => {
@@ -91,10 +111,17 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     onNavigate(integrationId)
   }
 
-  // Keeps backend-dependent controls honest until an Azure Dev API is available.
-  const backendUnavailable = () => showToast('Azure Dev backend integration is not configured')
-
   const visibleIntegrations = integrationCatalog.filter(integration => integration.name.toLowerCase().includes(integrationSearch.trim().toLowerCase()))
+
+  // Credential edits invalidate the previous live Azure DevOps verification.
+  const updateAzureCredentials = (field: 'organizationUrl' | 'personalAccessToken', value: string) => {
+    if (field === 'organizationUrl') setOrganizationUrl(value)
+    else setPersonalAccessToken(value)
+    setAzureDevConnected(false)
+    setAzureDevProjects([])
+    setSelectedProject('')
+    setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
+  }
 
   // Updates a checkbox group without duplicating values.
   const toggleOption = (value: string, selected: string[], update: (values: string[]) => void) => {
@@ -107,6 +134,9 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setPersonalAccessToken('')
     setShowToken(false)
     setSelectedProject('')
+    setAzureDevConnected(false)
+    setAzureDevProjects([])
+    setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
     setWorkItemTypes(['Bug', 'User Story'])
     setStates(['New', 'Active'])
     setTitleField('System.Title')
@@ -120,6 +150,32 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const fieldOptions = ['System.Title', 'System.Description', 'System.State', 'System.WorkItemType', 'System.Tags', 'System.AreaPath']
   const organizationSummary = organizationUrl.trim() || 'Not set'
 
+  // Calls the backend so Connected means Azure DevOps returned projects for this PAT.
+  const handleTestAzureConnection = async () => {
+    if (testingAzureDevConnection) return
+    if (!organizationUrl.trim() || !personalAccessToken.trim()) {
+      showToast('Enter an Azure DevOps organization URL and personal access token')
+      return
+    }
+    setTestingAzureDevConnection(true)
+    setAzureDevConnected(false)
+    setAzureDevProjects([])
+    setSelectedProject('')
+    try {
+      const result = await testAzureDevOpsConnection(organizationUrl, personalAccessToken)
+      setOrganizationUrl(result.organization_url)
+      setAzureDevProjects(result.projects)
+      setSelectedProject(result.projects[0]?.id ?? '')
+      setAzureDevConnected(result.connected && result.projects.length > 0)
+      setAzureDevConnectionMessage(`Verified ${result.projects.length} Azure DevOps project${result.projects.length === 1 ? '' : 's'}.`)
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Azure DevOps connection test failed.'
+      setAzureDevConnectionMessage(message)
+      showToast(message)
+    } finally {
+      setTestingAzureDevConnection(false)
+    }
+  }
   // Opens GitHub with a fresh copy so Cancel can discard edits without changing the saved configuration.
   const openGitHubConfiguration = () => {
     setGitHubDraft({ ...(savedGitHubConfiguration ?? initialGitHubConfiguration) })
@@ -202,7 +258,10 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     }
 
     if (pendingConfirmation.action === 'reconnect') {
-      if (pendingConfirmation.integrationId === 'azure-dev') setAzureDevConnected(true)
+      if (pendingConfirmation.integrationId === 'azure-dev') {
+        setAzureDevConnected(false)
+        setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
+      }
       else {
         setSavedGitHubConfiguration(current => current ? { ...current, connected: true } : current)
         setGitHubDraft(current => ({ ...current, connected: true }))
@@ -252,7 +311,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
       <p className="mt-1 text-[11px] leading-5 text-slate-500">Manage connected tools and services.</p>
       <nav className="mt-5" aria-label="Integrations">
         <p className="mb-2 px-3 text-[9px] font-bold uppercase tracking-[.12em] text-slate-400">Integrations</p>
-        {!azureDevDeleted && <div className="relative">
+        {!azureDevDeleted && <div ref={integrationMenuId === 'azure-dev' ? integrationMenuRef : undefined} className="relative">
           <button type="button" onClick={() => handleIntegrationRowOpen('azure-dev')} aria-current={selectedIntegration === 'azure-dev' ? 'page' : undefined} className={`flex min-h-10 w-full items-center gap-2.5 rounded-xl px-3 py-2 pr-8 text-left text-[12px] font-medium ${selectedIntegration === 'azure-dev' ? 'bg-[#eef4ff] text-blue-600 shadow-[0_2px_8px_rgba(37,99,235,.05)]' : 'text-slate-600 hover:bg-slate-50'}`}>
             <CloudCog size={17} strokeWidth={1.8} /><span className="min-w-0 flex-1"><span className="block truncate">Azure Dev</span><span className={`mt-0.5 flex items-center gap-1 text-[9px] font-semibold ${azureDevConnected ? 'text-emerald-600' : 'text-slate-500'}`}><span className={`h-1.5 w-1.5 rounded-full ${azureDevConnected ? 'bg-emerald-500' : 'bg-slate-400'}`} />{azureDevConnected ? 'Connected' : 'Disconnected'}</span></span>
           </button>
@@ -264,7 +323,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
             <button type="button" onClick={event => { event.stopPropagation(); handleMenuAction('azure-dev', 'delete') }} className="flex w-full items-center rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-red-600 hover:bg-red-50">Delete Configuration</button>
           </div>}
         </div>}
-        {savedGitHubConfiguration && <div className="relative mt-1">
+        {savedGitHubConfiguration && <div ref={integrationMenuId === 'github' ? integrationMenuRef : undefined} className="relative mt-1">
           <button type="button" onClick={() => handleIntegrationRowOpen('github')} aria-current={selectedIntegration === 'github' ? 'page' : undefined} className={`flex min-h-10 w-full items-center gap-2.5 rounded-xl px-3 py-2 pr-8 text-left text-[12px] font-medium ${selectedIntegration === 'github' ? 'bg-[#eef4ff] text-blue-600 shadow-[0_2px_8px_rgba(37,99,235,.05)]' : 'text-slate-600 hover:bg-slate-50'}`}>
             <Github size={17} strokeWidth={1.8} /><span className="min-w-0 flex-1"><span className="block truncate">GitHub</span><span className={`mt-0.5 flex items-center gap-1 text-[9px] font-semibold ${savedGitHubConfiguration.connected ? 'text-emerald-600' : 'text-slate-500'}`}><span className={`h-1.5 w-1.5 rounded-full ${savedGitHubConfiguration.connected ? 'bg-emerald-500' : 'bg-slate-400'}`} />{savedGitHubConfiguration.connected ? 'Connected' : 'Disconnected'}</span></span>
           </button>
@@ -291,11 +350,11 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           <p className="mt-1 text-[11px] text-slate-500">Connect to your Azure Dev organization.</p>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <Field label="Organization URL">
-              <input className="field w-full" type="url" value={organizationUrl} onChange={event => setOrganizationUrl(event.target.value)} placeholder="https://dev.azure.com/organization" />
+              <input className="field w-full" type="url" value={organizationUrl} onChange={event => updateAzureCredentials('organizationUrl', event.target.value)} placeholder="https://dev.azure.com/organization" />
             </Field>
             <Field label="Personal Access Token">
               <div className="relative">
-                <input className="field w-full pr-10" type={showToken ? 'text' : 'password'} value={personalAccessToken} onChange={event => setPersonalAccessToken(event.target.value)} autoComplete="off" />
+                <input className="field w-full pr-10" type={showToken ? 'text' : 'password'} value={personalAccessToken} onChange={event => updateAzureCredentials('personalAccessToken', event.target.value)} autoComplete="off" />
                 <button type="button" onClick={() => setShowToken(current => !current)} className="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-slate-400 hover:bg-slate-50 hover:text-blue-600" aria-label={showToken ? 'Hide personal access token' : 'Show personal access token'}>
                   {showToken ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
@@ -303,10 +362,10 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
             </Field>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            <Button type="button" size="sm" variant="secondary" onClick={backendUnavailable}>Test Connection</Button>
-            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">Connected</span>
+            <Button type="button" size="sm" variant="secondary" disabled={testingAzureDevConnection} onClick={handleTestAzureConnection}>{testingAzureDevConnection ? 'Testing...' : 'Test Connection'}</Button>
+            {azureDevConnected && <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">Connected</span>}
           </div>
-          <p className="mt-2 text-[11px] text-slate-500">Use Test Connection to verify the current credentials.</p>
+          <p className={`mt-2 text-[11px] ${azureDevConnected ? 'text-emerald-700' : 'text-slate-500'}`}>{azureDevConnectionMessage}</p>
         </Card>
 
         <Card className="mt-4 border-[#e6ecf5] p-4 shadow-[0_5px_18px_rgba(37,99,235,.04)]">
@@ -314,8 +373,9 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           <p className="mt-1 text-[11px] text-slate-500">Select the data you want to import.</p>
           <div className="mt-4">
             <Field label="Project">
-              <select className="field w-full sm:max-w-md" value={selectedProject} onChange={event => setSelectedProject(event.target.value)}>
-                <option value="">No Azure projects available</option>
+              <select className="field w-full sm:max-w-md" value={selectedProject} disabled={!azureDevConnected} onChange={event => setSelectedProject(event.target.value)}>
+                {!azureDevProjects.length && <option value="">No Azure projects available</option>}
+                {azureDevProjects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
               </select>
             </Field>
           </div>
@@ -386,7 +446,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           </dl>
           <div className="mt-4 flex justify-end gap-2">
             <Button type="button" variant="secondary" onClick={cancelAzureChanges}>Cancel</Button>
-            <Button type="button" onClick={backendUnavailable}>Save &amp; Sync</Button>
+            <Button type="button" disabled={!azureDevConnected} onClick={() => showToast('Azure DevOps connection verified. Sync configuration persistence is not available yet.')}>Save &amp; Sync</Button>
           </div>
         </Card>
       </div>

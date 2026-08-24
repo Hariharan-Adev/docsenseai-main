@@ -305,12 +305,6 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
               <button type="button" disabled={isDeleting && documentToDelete?.id === document.id} onClick={event => requestDelete(document, event)} className="grid h-7 w-7 place-items-center rounded-lg text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={`Delete ${document.name}`}><Trash2 size={14} /></button>
             </article>
           })}
-          {filtered.length > 0 && <div className="mt-8 rounded-lg border border-dashed border-slate-300 bg-slate-50/50 px-4 py-10 text-center">
-            <div className="flex justify-center text-slate-300 mb-3"><svg className="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg></div>
-            <p className="text-[13px] text-slate-600 font-medium">Drag and drop files here to upload</p>
-            <p className="text-[12px] text-slate-500 mt-1">or</p>
-            <button type="button" onClick={onUpload} className="mt-3 inline-flex h-8 items-center gap-2 rounded-lg bg-blue-600 px-3 text-[12px] font-semibold text-white hover:bg-blue-700">Upload files</button>
-          </div>}
           {!filtered.length && <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50/50 px-4 py-12 text-center text-[13px] text-slate-600">
             <FileText className="mx-auto text-slate-300" size={28} />
             <p className="mt-3 font-medium">{activeFolder ? 'No documents in this folder yet' : 'No documents found.'}</p>
