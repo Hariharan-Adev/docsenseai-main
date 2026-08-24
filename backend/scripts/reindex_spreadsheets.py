@@ -11,7 +11,7 @@ import sys
 from time import monotonic
 from typing import Sequence
 
-from app import database
+from db import database
 from app.services.structured_ingestion import (
     SpreadsheetReindexError,
     reindex_existing_spreadsheet_document,

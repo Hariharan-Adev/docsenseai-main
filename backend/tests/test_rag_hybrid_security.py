@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import database
+from db import database
 from app.services import vector_search
 
 

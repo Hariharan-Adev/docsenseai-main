@@ -13,7 +13,7 @@ from unittest.mock import patch
 from fastapi import UploadFile
 from starlette.requests import Request
 
-from app import database
+from db import database
 from app.routes import upload
 from app.services.keyword_search import search_keyword_chunks
 

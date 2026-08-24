@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Iterable, Sequence
 
 from app.config import settings
-from app.database import get_connection, initialize_database
+from db.database import get_connection, initialize_database
 from app.services.embeddings import create_embeddings
 from app.services.vector_store import (
     VectorPoint,

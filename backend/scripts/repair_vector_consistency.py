@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import logging
 
-from app.database import get_connection, initialize_database
+from db.database import get_connection, initialize_database
 from app.services.vector_store import get_vector_store
 from scripts.check_vector_consistency import check_consistency
 from scripts.migrate_vectors_to_qdrant import migrate_vectors

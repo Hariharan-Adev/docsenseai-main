@@ -1,4 +1,4 @@
-﻿# RAG Project Engineering Loop Workflow
+# RAG Project Engineering Loop Workflow
 
 This workflow is used to implement, test, secure, and document changes in the RAG project.
 
@@ -6,7 +6,7 @@ Project context:
 - Backend: FastAPI
 - Frontend: React/Vite
 - Worker: background ingestion worker
-- Database: SQLite, resolved through `app.database.DATABASE_PATH`
+- Database: SQLite, resolved through `db.database.DATABASE_PATH`
 - Vector store: Qdrant, often local Qdrant in development
 - Main risk areas: document upload, extraction, chunking, embeddings, retrieval, citations, SQLite persistence, Qdrant sync, and frontend chat behavior
 
@@ -102,7 +102,7 @@ Tasks:
 
 RAG-specific checks:
 - Check whether the issue is in parsing, chunking, embeddings, Qdrant sync, SQLite persistence, retrieval ranking, prompt context, or citation formatting.
-- Resolve the active database through `app.database.DATABASE_PATH`.
+- Resolve the active database through `db.database.DATABASE_PATH`.
 - Do not assume `rag.db` is the active database.
 - Do not rebuild or reindex unless evidence shows it is needed.
 

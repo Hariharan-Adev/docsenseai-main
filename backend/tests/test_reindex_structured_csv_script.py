@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import database
+from db import database
 from app.routes import documents as document_routes
 from app.services import vector_store
 from app.services.storage import storage_key_for, write_storage_bytes

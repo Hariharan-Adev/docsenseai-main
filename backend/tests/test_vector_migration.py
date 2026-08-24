@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database
+from db import database
 from app.services.vector_store import make_vector_point_id
 from scripts import migrate_vectors_to_qdrant as migration
 

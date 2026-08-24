@@ -180,7 +180,7 @@ not expose unauthenticated public ports.
 `QDRANT_MODE` accepts `auto`, `local`, `remote`, or `memory`. `auto` preserves
 legacy behavior by selecting a configured URL first, then `QDRANT_PATH` (or the
 legacy `QDRANT_LOCAL_PATH`), then in-memory storage. Use `local` plus
-`QDRANT_PATH=./data/qdrant` for persistent development without Docker. Production
+`QDRANT_PATH=db/qdrant_data` for persistent development without Docker. Production
 requires `remote`, HTTPS, and an API key. The application uses one collection and
 creates remote payload indexes for organization, owner, document, version,
 visibility, and deletion filters.

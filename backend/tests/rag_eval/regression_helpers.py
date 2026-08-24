@@ -18,7 +18,7 @@ from fastapi import UploadFile
 from openpyxl import Workbook
 from starlette.requests import Request
 
-from app import database
+from db import database
 from app.prompts.rag_prompt import UNAVAILABLE_ANSWER
 from app.routes import upload
 from app.services import rag_service, source_selection, structured_ingestion, vector_store

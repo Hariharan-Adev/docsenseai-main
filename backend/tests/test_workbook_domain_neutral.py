@@ -15,7 +15,7 @@ from fastapi import UploadFile
 from openpyxl import Workbook
 from starlette.requests import Request
 
-from app import database
+from db import database
 from app.routes import upload
 from app.services import structured_ingestion, vector_search, vector_store
 from app.services.chat_context import save_grounded_context

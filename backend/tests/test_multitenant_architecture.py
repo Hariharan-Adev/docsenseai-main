@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import database
+from db import database
 from app.auth import get_current_user
 from app.main import app
 from app.services import ingestion_jobs, vector_search

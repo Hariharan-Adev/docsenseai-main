@@ -46,6 +46,50 @@ class FinalContextSelectionTests(unittest.TestCase):
 
         self.assertEqual([source["chunk_id"] for source in selected], [1])
 
+    def test_overview_question_keeps_multiple_matching_prose_sections(self) -> None:
+        """Broad explanation requests keep complementary same-source sections."""
+        selected = rag_service.select_final_context(
+            "Explain benefit matrix document",
+            [
+                _source(1, 10, 8, "Steps to delete the benefit matrix\n\nAn applied matrix cannot be deleted.", 0.95),
+                _source(2, 10, 3, "Configure benefit matrix\n\nSelect the population and market indicator.", 0.82),
+                _source(3, 10, 4, "Build benefit matrix\n\nSet the minimum, target, and maximum values.", 0.78),
+                _source(4, 10, 5, "Apply benefit matrix\n\nApply the matrix to the selected population.", 0.74),
+                _source(5, 10, 30, "Configure bonus rules for a separate payout.", 0.70),
+            ],
+        )
+
+        selected_ids = [source["chunk_id"] for source in selected]
+        self.assertEqual(selected_ids[:3], [2, 3, 4])
+        self.assertIn(1, selected_ids)
+        self.assertNotIn(5, selected_ids)
+
+    def test_overview_question_does_not_pull_similar_terms_from_another_document(self) -> None:
+        """Overview expansion stays inside the selected document/version."""
+        selected = rag_service.select_final_context(
+            "Give an overview of benefit matrix",
+            [
+                _source(1, 10, 2, "Configure benefit matrix\n\nChoose ranges for the population.", 0.92),
+                _source(2, 20, 1, "Benefit matrix appendix\n\nArchive-only notes from another file.", 0.91),
+                _source(3, 10, 3, "Build benefit matrix\n\nSave the configured values.", 0.86),
+            ],
+        )
+
+        self.assertEqual([source["chunk_id"] for source in selected], [1, 3])
+
+    def test_narrow_applied_matrix_deletion_question_stays_concise(self) -> None:
+        """Narrow factual questions keep the old single-evidence behavior."""
+        selected = rag_service.select_final_context(
+            "Can an applied benefit matrix be deleted?",
+            [
+                _source(1, 10, 8, "Steps to delete the benefit matrix\n\nAn applied matrix cannot be deleted.", 0.95),
+                _source(2, 10, 3, "Configure benefit matrix\n\nSelect the population and market indicator.", 0.82),
+                _source(3, 10, 4, "Build benefit matrix\n\nSet the minimum, target, and maximum values.", 0.78),
+            ],
+        )
+
+        self.assertEqual([source["chunk_id"] for source in selected], [1])
+
     def test_normal_question_keeps_table_and_relevant_paragraph_qualification(self) -> None:
         """Complementary prose remains available when it qualifies a table value."""
         selected = rag_service.select_final_context(

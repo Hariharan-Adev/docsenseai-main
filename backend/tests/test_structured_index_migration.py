@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import database
+from db import database
 from app.services.storage import storage_key_for, write_storage_bytes
 from app.services.structured_ingestion import (
     StructuredDocumentContext,

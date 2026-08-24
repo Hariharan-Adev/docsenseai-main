@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import database
+from db import database
 from app.services.chat_history import (
     append_exchange,
     delete_conversation,

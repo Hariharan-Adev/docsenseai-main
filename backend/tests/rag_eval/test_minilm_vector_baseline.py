@@ -15,7 +15,7 @@ from unittest.mock import patch
 from fastapi import UploadFile
 from starlette.requests import Request
 
-from app import database
+from db import database
 from app.config import settings
 from app.routes import upload
 from app.services import vector_search, vector_store

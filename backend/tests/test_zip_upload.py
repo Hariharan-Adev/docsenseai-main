@@ -14,7 +14,7 @@ from unittest.mock import patch
 from fastapi import HTTPException, UploadFile
 from starlette.requests import Request
 
-from app import database
+from db import database
 from app.routes import documents, upload
 from app.services import zip_archives
 from app.config import settings

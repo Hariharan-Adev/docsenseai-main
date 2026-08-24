@@ -1,0 +1,37 @@
+Run these from PowerShell.
+
+**Terminal 1: Qdrant**
+```powershell
+cd "C:\Users\aparna_adevtechcorp\Desktop\RAG PROJECT NEW CLONED"
+docker compose up -d qdrant
+```
+
+**Terminal 2: Backend API**
+```powershell
+cd "C:\Users\aparna_adevtechcorp\Desktop\RAG PROJECT NEW CLONED\backend"
+.\venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+**Terminal 3: Worker**
+```powershell
+cd "C:\Users\aparna_adevtechcorp\Desktop\RAG PROJECT NEW CLONED\backend"
+.\venv\Scripts\python.exe -m app.worker
+```
+
+**Terminal 4: Frontend**
+```powershell
+cd "C:\Users\aparna_adevtechcorp\Desktop\RAG PROJECT NEW CLONED\frontend"
+npm run dev
+```
+
+Then open the Vite URL shown in Terminal 4, usually:
+
+```text
+http://localhost:5173
+```
+
+Optional health check:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/health"
+```

@@ -7,7 +7,7 @@ from collections import Counter
 import json
 from typing import Any
 
-from app.database import get_connection, initialize_database
+from db.database import get_connection, initialize_database
 from app.services.vector_store import get_vector_store
 
 

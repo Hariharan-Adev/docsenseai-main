@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app import database
+from db import database
 from app.auth import get_current_user
 from app.main import app
 

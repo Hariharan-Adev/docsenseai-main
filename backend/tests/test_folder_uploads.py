@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from app import database
+from db import database
 from app.services import vector_search
 from app.services import vector_store
 from app.services.vector_store import VectorPoint, get_vector_store, reset_vector_store_for_tests

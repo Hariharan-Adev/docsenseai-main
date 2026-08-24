@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from app import database
+from db import database
 from app.auth import get_current_user
 from app.main import app
 from app.routes import ingestion as ingestion_route
