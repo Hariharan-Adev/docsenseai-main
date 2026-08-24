@@ -136,7 +136,16 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
     if (!targets.length || uploading) return
     const batchItems = includeSkipped ? items : targets
     const targetIds = new Set(targets.map(item => item.id))
-    let hasFailures = items.some(item => !targetIds.has(item.id) && (item.status === 'failed' || item.status === 'cancelled' || Boolean(item.archiveResult?.summary.failed)))
+    let hasNonNewOutcome = items.some(item => !targetIds.has(item.id) && (
+      item.status !== 'completed'
+      || Boolean(item.result?.content_reused)
+      || Boolean(item.result?.duplicate_type)
+      || item.result?.status === 'duplicate_content_reused'
+      || item.result?.status === 'failed'
+      || item.result?.status === 'cancelled'
+      || Boolean(item.archiveResult?.summary.duplicates)
+      || Boolean(item.archiveResult?.summary.failed)
+    ))
     const totalBytes = batchItems.reduce((total, item) => total + item.file.size, 0)
     if (mode === 'folder' && items.length > config.max_folder_files) {
       showToast(`A folder may contain at most ${config.max_folder_files} files.`)
@@ -188,7 +197,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
                 signal: controller.signal,
                 idempotencyKey: `archive:${item.idempotencyKey}`,
               })
-              if (archiveResult.summary.failed > 0) hasFailures = true
+              if (archiveResult.summary.duplicates > 0 || archiveResult.summary.failed > 0) hasNonNewOutcome = true
               setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', archiveResult } : current))
             } else {
               const result = await uploadDocument(item.file, {
@@ -197,11 +206,12 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
                 signal: controller.signal,
                 idempotencyKey: `document:${item.idempotencyKey}`,
               })
+              if (result.content_reused || result.duplicate_type || result.status === 'duplicate_content_reused' || result.status === 'failed' || result.status === 'cancelled') hasNonNewOutcome = true
               setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', result } : current))
             }
           } catch (error) {
             const aborted = error instanceof DOMException && error.name === 'AbortError'
-            if (aborted || !(error instanceof ApiError && error.status === 409)) hasFailures = true
+            hasNonNewOutcome = true
             const message = error instanceof ApiError ? error.message : aborted ? 'Cancelled' : error instanceof Error ? error.message : 'Upload failed.'
             setItems(previous => previous.map(current => current.id === item.id ? {
               ...current,
@@ -217,7 +227,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
       }
       await Promise.all(Array.from({ length: Math.min(config.max_concurrent_uploads, targets.length) }, () => worker()))
       await refreshDocuments()
-      if (!hasFailures && !cancelledRef.current) resetAndClose()
+      if (!hasNonNewOutcome && !cancelledRef.current) resetAndClose()
     } catch (error) {
       showToast(error instanceof Error ? error.message : 'Folder upload could not be started.')
     } finally {
