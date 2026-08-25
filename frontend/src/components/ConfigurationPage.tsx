@@ -1,4 +1,4 @@
-import { Building2, ChevronLeft, ChevronRight, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
+import { Building2, ChevronLeft, ChevronRight, ChevronUp, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
 import { ApiError, listAzureDevOpsImportedItems, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsImportedItemsResponse, type AzureDevOpsProject } from '../services/api'
@@ -80,13 +80,11 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [syncingAzureDevWorkItems, setSyncingAzureDevWorkItems] = useState(false)
   const [showImportedWorkItems, setShowImportedWorkItems] = useState(false)
   const [loadingImportedWorkItems, setLoadingImportedWorkItems] = useState(false)
+  const [importedItemsCount, setImportedItemsCount] = useState(0)
   const [importedItemsResponse, setImportedItemsResponse] = useState<AzureDevOpsImportedItemsResponse | null>(null)
   const [importedSearch, setImportedSearch] = useState('')
-  const [appliedImportedSearch, setAppliedImportedSearch] = useState('')
   const [importedTypeFilter, setImportedTypeFilter] = useState('')
-  const [appliedImportedTypeFilter, setAppliedImportedTypeFilter] = useState('')
   const [importedStateFilter, setImportedStateFilter] = useState('')
-  const [appliedImportedStateFilter, setAppliedImportedStateFilter] = useState('')
   const [importedPage, setImportedPage] = useState(1)
   const [expandedImportedDocumentId, setExpandedImportedDocumentId] = useState<number | null>(null)
   const [azureDevConnected, setAzureDevConnected] = useState(false)
@@ -96,6 +94,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [integrationMenuId, setIntegrationMenuId] = useState<'azure-dev' | 'github' | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<{ integrationId: 'azure-dev' | 'github'; action: 'disconnect' | 'reconnect' | 'delete' } | null>(null)
   const integrationMenuRef = useRef<HTMLDivElement | null>(null)
+  const importedItemsRequestId = useRef(0)
 
   useEffect(() => {
     const routeSelection = routeIntegrationId === 'azure-dev' || routeIntegrationId === 'github' || routeIntegrationId === 'catalog' ? routeIntegrationId : null
@@ -171,38 +170,50 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
 
   // Reads only existing synced Azure work items from the backend; it never calls Azure directly.
   const loadImportedAzureWorkItems = async (page = importedPage) => {
-    if (loadingImportedWorkItems) return
+    const requestId = ++importedItemsRequestId.current
     setLoadingImportedWorkItems(true)
     try {
       const result = await listAzureDevOpsImportedItems({
-        search: appliedImportedSearch.trim(),
-        work_item_type: appliedImportedTypeFilter,
-        state: appliedImportedStateFilter,
+        search: importedSearch.trim(),
+        work_item_type: importedTypeFilter,
+        state: importedStateFilter,
         page,
         page_size: 10,
       })
+      // A slower earlier request must not replace results for the newest filter values.
+      if (requestId !== importedItemsRequestId.current) return
       setImportedItemsResponse(result)
       setExpandedImportedDocumentId(null)
     } catch (error) {
+      if (requestId !== importedItemsRequestId.current) return
       const message = error instanceof ApiError ? error.message : 'Imported Azure work items could not be loaded.'
       showToast(message)
     } finally {
-      setLoadingImportedWorkItems(false)
+      if (requestId === importedItemsRequestId.current) setLoadingImportedWorkItems(false)
     }
   }
 
-  // Applies draft filters only when the user clicks Filter, matching the requested workflow.
+  // Keeps the existing Filter action as an explicit refresh of the current criteria.
   const applyImportedFilters = () => {
-    setAppliedImportedSearch(importedSearch)
-    setAppliedImportedTypeFilter(importedTypeFilter)
-    setAppliedImportedStateFilter(importedStateFilter)
-    setImportedPage(1)
+    if (importedPage === 1) void loadImportedAzureWorkItems(1)
+    else setImportedPage(1)
   }
 
   useEffect(() => {
     if (!showImportedWorkItems) return
     void loadImportedAzureWorkItems(importedPage)
-  }, [showImportedWorkItems, importedPage, appliedImportedSearch, appliedImportedTypeFilter, appliedImportedStateFilter])
+  }, [showImportedWorkItems, importedPage, importedSearch, importedTypeFilter, importedStateFilter])
+
+  // Reads the unfiltered total used by the connected integration summary link.
+  const refreshImportedAzureItemCount = async () => {
+    try {
+      const result = await listAzureDevOpsImportedItems({ page: 1, page_size: 1 })
+      setImportedItemsCount(result.total)
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Imported Azure work item count could not be loaded.'
+      showToast(message)
+    }
+  }
 
   // Calls the backend so Connected means Azure DevOps returned projects for this PAT.
   const handleTestAzureConnection = async () => {
@@ -213,6 +224,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     }
     setTestingAzureDevConnection(true)
     setAzureDevConnected(false)
+    setShowImportedWorkItems(false)
     setAzureDevProjects([])
     setSelectedProject('')
     try {
@@ -222,6 +234,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
       setSelectedProject(result.projects[0]?.id ?? '')
       setAzureDevConnected(result.connected && result.projects.length > 0)
       setAzureDevConnectionMessage(`Verified ${result.projects.length} Azure DevOps project${result.projects.length === 1 ? '' : 's'}.`)
+      if (result.connected && result.projects.length > 0) void refreshImportedAzureItemCount()
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Azure DevOps connection test failed.'
       setAzureDevConnectionMessage(message)
@@ -259,6 +272,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
       const message = `Imported ${result.imported_count} Azure work item${result.imported_count === 1 ? '' : 's'}${result.skipped_count ? `, skipped ${result.skipped_count} unchanged` : ''}.`
       setAzureDevConnectionMessage(message)
       showToast(message)
+      void refreshImportedAzureItemCount()
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Azure DevOps sync failed.'
       setAzureDevConnectionMessage(message)
@@ -454,7 +468,11 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Button type="button" size="sm" variant="secondary" disabled={testingAzureDevConnection} onClick={handleTestAzureConnection}>{testingAzureDevConnection ? 'Testing...' : 'Test Connection'}</Button>
-            <Button type="button" size="sm" variant="secondary" onClick={() => setShowImportedWorkItems(current => !current)}>{showImportedWorkItems ? 'Hide imported items' : 'View imported items'}</Button>
+            {azureDevConnected && <button type="button" className="inline-flex items-center gap-1 text-[11px] text-slate-600 hover:text-blue-700" onClick={() => setShowImportedWorkItems(current => !current)} aria-expanded={showImportedWorkItems}>
+              <span>Imported {importedItemsCount} Azure work items.</span>
+              <span className="font-semibold text-blue-600">View imported items</span>
+              {showImportedWorkItems ? <ChevronUp size={13} /> : <ChevronRight size={13} />}
+            </button>}
             {azureDevConnected && <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">Connected</span>}
           </div>
           <p className={`mt-2 text-[11px] ${azureDevConnected ? 'text-emerald-700' : 'text-slate-500'}`}>{azureDevConnectionMessage}</p>
@@ -474,15 +492,15 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           </dl>
           <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_160px_160px_auto]">
             <Field label="Search by ID/title">
-              <input className="field w-full" value={importedSearch} onChange={event => setImportedSearch(event.target.value)} placeholder="Search imported items" />
+              <input className="field w-full" value={importedSearch} onChange={event => { setImportedSearch(event.target.value); setImportedPage(1) }} placeholder="Search imported items" />
             </Field>
             <Field label="Type filter">
-              <select className="field w-full" value={importedTypeFilter} onChange={event => setImportedTypeFilter(event.target.value)}>
+              <select className="field w-full" value={importedTypeFilter} onChange={event => { setImportedTypeFilter(event.target.value); setImportedPage(1) }}>
                 {importedTypeOptions.map(option => <option key={option || 'all-types'} value={option}>{option || 'All types'}</option>)}
               </select>
             </Field>
             <Field label="State filter">
-              <select className="field w-full" value={importedStateFilter} onChange={event => setImportedStateFilter(event.target.value)}>
+              <select className="field w-full" value={importedStateFilter} onChange={event => { setImportedStateFilter(event.target.value); setImportedPage(1) }}>
                 {importedStateOptions.map(option => <option key={option || 'all-states'} value={option}>{option || 'All states'}</option>)}
               </select>
             </Field>

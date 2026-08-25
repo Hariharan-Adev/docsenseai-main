@@ -579,9 +579,12 @@ export async function listAzureDevOpsImportedItems(params: {
   page_size?: number
 }) {
   const query = new URLSearchParams()
-  if (params.search) query.set('search', params.search)
-  if (params.work_item_type) query.set('work_item_type', params.work_item_type)
-  if (params.state) query.set('state', params.state)
+  const search = params.search?.trim()
+  const workItemType = params.work_item_type?.trim()
+  const state = params.state?.trim()
+  if (search) query.set('search', search)
+  if (workItemType) query.set('work_item_type', workItemType)
+  if (state) query.set('state', state)
   if (params.page) query.set('page', String(params.page))
   if (params.page_size) query.set('page_size', String(params.page_size))
   return requestJson<AzureDevOpsImportedItemsResponse>(`/integrations/azure-devops/imported-items?${query.toString()}`, {
