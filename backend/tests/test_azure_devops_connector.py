@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from app.services.azure_devops import (
     AzureDevOpsProject,
     AzureDevOpsValidationResult,
     normalize_organization_url,
+    sync_work_items,
     validate_connection,
 )
 from db import database
@@ -174,6 +176,104 @@ class AzureDevOpsServiceTests(unittest.TestCase):
 
         self.assertEqual(failure.exception.code, "projects_request_failed")
         self.assertEqual(failure.exception.message, "The requested project API version is invalid.")
+
+    def test_sync_work_items_indexes_selected_source_and_content_fields(self) -> None:
+        """Selected Azure source filters and content fields become RAG chunks."""
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "azure-sync.db"
+            with patch.object(database, "DATABASE_PATH", database_path):
+                database.initialize_database()
+                with database.get_connection() as connection:
+                    connection.execute(
+                        "INSERT INTO organizations (id, name) VALUES ('org-a', 'Org A')"
+                    )
+                    connection.execute(
+                        """INSERT INTO users
+                           (id, email, password_hash, organization_id, role)
+                           VALUES (1, 'owner@example.com', 'hash', 'org-a',
+                                   'organization_admin')"""
+                    )
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    """Return Azure-like WIQL and batch work-item responses."""
+                    if request.url.path == "/Laserbeamch/Hunt/_apis/wit/wiql":
+                        body = json.loads(request.content.decode("utf-8"))
+                        self.assertTrue(body["query"].startswith("SELECT [System.Id] FROM WorkItems"))
+                        self.assertNotIn("SELECT TOP", body["query"])
+                        self.assertIn("[System.WorkItemType] IN ('Bug')", body["query"])
+                        self.assertIn("[System.State] IN ('Active')", body["query"])
+                        return httpx.Response(200, json={"workItems": [{"id": 101}]})
+                    if request.url.path == "/Laserbeamch/Hunt/_apis/wit/workitemsbatch":
+                        body = json.loads(request.content.decode("utf-8"))
+                        self.assertEqual(
+                            body["fields"],
+                            ["System.Description", "System.State", "System.Title"],
+                        )
+                        return httpx.Response(
+                            200,
+                            json={
+                                "value": [{
+                                    "id": 101,
+                                    "fields": {
+                                        "System.Title": "Login bug",
+                                        "System.Description": "<p>Login fails on submit</p>",
+                                        "System.State": "Active",
+                                    },
+                                }]
+                            },
+                        )
+                    return httpx.Response(404, json={})
+
+                class FakeVectorStore:
+                    """Capture vector writes without requiring Qdrant in this unit test."""
+
+                    def __init__(self) -> None:
+                        self.points = []
+
+                    def upsert_chunks(self, points) -> None:
+                        self.points.extend(points)
+
+                store = FakeVectorStore()
+                transport = httpx.MockTransport(handler)
+                real_client = httpx.Client
+
+                def client_factory(*args, **kwargs):
+                    """Inject mocked Azure responses into the sync client."""
+                    return real_client(transport=transport)
+
+                with patch.object(azure_devops.httpx, "Client", side_effect=client_factory), \
+                    patch.object(azure_devops, "create_embeddings", return_value=[[1.0] + [0.0] * 383]), \
+                    patch.object(azure_devops, "get_vector_store", return_value=store):
+                    result = sync_work_items(
+                        organization_url="https://dev.azure.com/Laserbeamch",
+                        personal_access_token="pat-value",
+                        project_id="project-1",
+                        project_name="Hunt",
+                        work_item_types=["Bug"],
+                        states=["Active"],
+                        title_field="System.Title",
+                        content_field="System.Description",
+                        metadata_fields=["System.State"],
+                        owner_id=1,
+                        organization_id="org-a",
+                    )
+
+                self.assertEqual(result.imported_count, 1)
+                self.assertEqual(result.items[0].work_item_id, 101)
+                self.assertEqual(len(store.points), 1)
+                with database.get_connection() as connection:
+                    chunk = connection.execute(
+                        """SELECT text, source_type, source_location_json,
+                                  indexing_status
+                           FROM chunks"""
+                    ).fetchone()
+                self.assertEqual(chunk["source_type"], "azure_devops")
+                self.assertEqual(chunk["indexing_status"], "completed")
+                self.assertIn("Content: Login fails on submit", chunk["text"])
+                self.assertIn("System.State: Active", chunk["text"])
+                location = json.loads(chunk["source_location_json"])
+                self.assertEqual(location["project_name"], "Hunt")
+                self.assertEqual(location["work_item_id"], 101)
 
 
 class AzureDevOpsRouteTests(unittest.TestCase):

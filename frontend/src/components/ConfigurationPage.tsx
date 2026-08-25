@@ -1,7 +1,7 @@
 import { Building2, ChevronLeft, ChevronRight, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
-import { ApiError, testAzureDevOpsConnection, type AzureDevOpsProject } from '../services/api'
+import { ApiError, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsProject } from '../services/api'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
 
@@ -77,6 +77,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [testingGitHubConnection, setTestingGitHubConnection] = useState(false)
   const [savingGitHubConfiguration, setSavingGitHubConfiguration] = useState(false)
   const [testingAzureDevConnection, setTestingAzureDevConnection] = useState(false)
+  const [syncingAzureDevWorkItems, setSyncingAzureDevWorkItems] = useState(false)
   const [azureDevConnected, setAzureDevConnected] = useState(false)
   const [azureDevProjects, setAzureDevProjects] = useState<AzureDevOpsProject[]>([])
   const [azureDevConnectionMessage, setAzureDevConnectionMessage] = useState('Use Test Connection to verify the current credentials.')
@@ -174,6 +175,43 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
       showToast(message)
     } finally {
       setTestingAzureDevConnection(false)
+    }
+  }
+
+  // Sends the selected Azure Boards source and field mapping to the backend importer.
+  const handleSyncAzureWorkItems = async () => {
+    if (syncingAzureDevWorkItems) return
+    const project = azureDevProjects.find(item => item.id === selectedProject)
+    if (!organizationUrl.trim() || !personalAccessToken.trim() || !azureDevConnected || !project) {
+      showToast('Test the Azure DevOps connection and select a project before syncing')
+      return
+    }
+    if (!workItemTypes.length || !states.length) {
+      showToast('Select at least one work item type and state before syncing')
+      return
+    }
+    setSyncingAzureDevWorkItems(true)
+    try {
+      const result = await syncAzureDevOpsWorkItems({
+        organization_url: organizationUrl,
+        personal_access_token: personalAccessToken,
+        project_id: project.id,
+        project_name: project.name,
+        work_item_types: workItemTypes,
+        states,
+        title_field: titleField,
+        content_field: contentField,
+        metadata_fields: metadataFields,
+      })
+      const message = `Imported ${result.imported_count} Azure work item${result.imported_count === 1 ? '' : 's'}${result.skipped_count ? `, skipped ${result.skipped_count} unchanged` : ''}.`
+      setAzureDevConnectionMessage(message)
+      showToast(message)
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Azure DevOps sync failed.'
+      setAzureDevConnectionMessage(message)
+      showToast(message)
+    } finally {
+      setSyncingAzureDevWorkItems(false)
     }
   }
   // Opens GitHub with a fresh copy so Cancel can discard edits without changing the saved configuration.
@@ -445,8 +483,8 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
             <SummaryItem label="Sync" value={syncMode === 'manual' ? 'Manual' : frequency} />
           </dl>
           <div className="mt-4 flex justify-end gap-2">
-            <Button type="button" variant="secondary" onClick={cancelAzureChanges}>Cancel</Button>
-            <Button type="button" disabled={!azureDevConnected} onClick={() => showToast('Azure DevOps connection verified. Sync configuration persistence is not available yet.')}>Save &amp; Sync</Button>
+            <Button type="button" variant="secondary" disabled={syncingAzureDevWorkItems} onClick={cancelAzureChanges}>Cancel</Button>
+            <Button type="button" disabled={!azureDevConnected || syncingAzureDevWorkItems} onClick={handleSyncAzureWorkItems}>{syncingAzureDevWorkItems ? 'Syncing...' : 'Save & Sync'}</Button>
           </div>
         </Card>
       </div>

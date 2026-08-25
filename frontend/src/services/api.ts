@@ -82,6 +82,30 @@ export interface AzureDevOpsTestResponse {
   checks: string[]
 }
 
+export interface AzureDevOpsSyncRequest {
+  organization_url: string
+  personal_access_token: string
+  project_id: string
+  project_name: string
+  work_item_types: string[]
+  states: string[]
+  title_field: string
+  content_field: string
+  metadata_fields: string[]
+}
+
+export interface AzureDevOpsSyncResponse {
+  project_id: string
+  project_name: string
+  imported_count: number
+  skipped_count: number
+  items: Array<{
+    document_id: number
+    work_item_id: number
+    title: string
+  }>
+}
+
 export interface FolderRecord {
   id: string
   name: string
@@ -518,6 +542,14 @@ export async function testAzureDevOpsConnection(organizationUrl: string, persona
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ organization_url: organizationUrl, personal_access_token: personalAccessToken }),
+  })
+}
+
+export async function syncAzureDevOpsWorkItems(payload: AzureDevOpsSyncRequest) {
+  return requestJson<AzureDevOpsSyncResponse>('/integrations/azure-devops/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
   })
 }
 
