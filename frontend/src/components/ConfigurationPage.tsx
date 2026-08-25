@@ -1,7 +1,7 @@
 import { Building2, ChevronLeft, ChevronRight, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
-import { ApiError, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsProject } from '../services/api'
+import { ApiError, listAzureDevOpsImportedItems, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsImportedItemsResponse, type AzureDevOpsProject } from '../services/api'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
 
@@ -78,6 +78,17 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [savingGitHubConfiguration, setSavingGitHubConfiguration] = useState(false)
   const [testingAzureDevConnection, setTestingAzureDevConnection] = useState(false)
   const [syncingAzureDevWorkItems, setSyncingAzureDevWorkItems] = useState(false)
+  const [showImportedWorkItems, setShowImportedWorkItems] = useState(false)
+  const [loadingImportedWorkItems, setLoadingImportedWorkItems] = useState(false)
+  const [importedItemsResponse, setImportedItemsResponse] = useState<AzureDevOpsImportedItemsResponse | null>(null)
+  const [importedSearch, setImportedSearch] = useState('')
+  const [appliedImportedSearch, setAppliedImportedSearch] = useState('')
+  const [importedTypeFilter, setImportedTypeFilter] = useState('')
+  const [appliedImportedTypeFilter, setAppliedImportedTypeFilter] = useState('')
+  const [importedStateFilter, setImportedStateFilter] = useState('')
+  const [appliedImportedStateFilter, setAppliedImportedStateFilter] = useState('')
+  const [importedPage, setImportedPage] = useState(1)
+  const [expandedImportedDocumentId, setExpandedImportedDocumentId] = useState<number | null>(null)
   const [azureDevConnected, setAzureDevConnected] = useState(false)
   const [azureDevProjects, setAzureDevProjects] = useState<AzureDevOpsProject[]>([])
   const [azureDevConnectionMessage, setAzureDevConnectionMessage] = useState('Use Test Connection to verify the current credentials.')
@@ -149,7 +160,49 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   }
 
   const fieldOptions = ['System.Title', 'System.Description', 'System.State', 'System.WorkItemType', 'System.Tags', 'System.AreaPath']
+  const importedTypeOptions = ['', 'Bug', 'User Story', 'Task', 'Epic']
+  const importedStateOptions = ['', 'New', 'Active', 'Resolved', 'Closed']
   const organizationSummary = organizationUrl.trim() || 'Not set'
+  const importedTotal = importedItemsResponse?.total ?? 0
+  const importedPageSize = importedItemsResponse?.page_size ?? 10
+  const importedRangeStart = importedTotal ? (importedPage - 1) * importedPageSize + 1 : 0
+  const importedRangeEnd = importedTotal ? Math.min(importedPage * importedPageSize, importedTotal) : 0
+  const importedHasNextPage = importedPage * importedPageSize < importedTotal
+
+  // Reads only existing synced Azure work items from the backend; it never calls Azure directly.
+  const loadImportedAzureWorkItems = async (page = importedPage) => {
+    if (loadingImportedWorkItems) return
+    setLoadingImportedWorkItems(true)
+    try {
+      const result = await listAzureDevOpsImportedItems({
+        search: appliedImportedSearch.trim(),
+        work_item_type: appliedImportedTypeFilter,
+        state: appliedImportedStateFilter,
+        page,
+        page_size: 10,
+      })
+      setImportedItemsResponse(result)
+      setExpandedImportedDocumentId(null)
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Imported Azure work items could not be loaded.'
+      showToast(message)
+    } finally {
+      setLoadingImportedWorkItems(false)
+    }
+  }
+
+  // Applies draft filters only when the user clicks Filter, matching the requested workflow.
+  const applyImportedFilters = () => {
+    setAppliedImportedSearch(importedSearch)
+    setAppliedImportedTypeFilter(importedTypeFilter)
+    setAppliedImportedStateFilter(importedStateFilter)
+    setImportedPage(1)
+  }
+
+  useEffect(() => {
+    if (!showImportedWorkItems) return
+    void loadImportedAzureWorkItems(importedPage)
+  }, [showImportedWorkItems, importedPage, appliedImportedSearch, appliedImportedTypeFilter, appliedImportedStateFilter])
 
   // Calls the backend so Connected means Azure DevOps returned projects for this PAT.
   const handleTestAzureConnection = async () => {
@@ -401,11 +454,92 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Button type="button" size="sm" variant="secondary" disabled={testingAzureDevConnection} onClick={handleTestAzureConnection}>{testingAzureDevConnection ? 'Testing...' : 'Test Connection'}</Button>
+            <Button type="button" size="sm" variant="secondary" onClick={() => setShowImportedWorkItems(current => !current)}>{showImportedWorkItems ? 'Hide imported items' : 'View imported items'}</Button>
             {azureDevConnected && <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">Connected</span>}
           </div>
           <p className={`mt-2 text-[11px] ${azureDevConnected ? 'text-emerald-700' : 'text-slate-500'}`}>{azureDevConnectionMessage}</p>
         </Card>
 
+        {showImportedWorkItems && <Card className="mt-4 border-[#e6ecf5] p-4 shadow-[0_5px_18px_rgba(37,99,235,.04)]">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">Imported Work Items</h3>
+              <p className="mt-1 text-[11px] text-slate-500">Review work items already imported from Azure Boards.</p>
+            </div>
+            <Button type="button" size="sm" variant="secondary" disabled={loadingImportedWorkItems} onClick={() => loadImportedAzureWorkItems(importedPage)}>{loadingImportedWorkItems ? 'Refreshing...' : 'Refresh'}</Button>
+          </div>
+          <dl className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-slate-50 p-3 text-[11px] sm:grid-cols-2">
+            <SummaryItem label="Imported count" value={String(importedTotal)} />
+            <SummaryItem label="Last synced" value={formatImportedDate(importedItemsResponse?.last_synced_at)} />
+          </dl>
+          <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_160px_160px_auto]">
+            <Field label="Search by ID/title">
+              <input className="field w-full" value={importedSearch} onChange={event => setImportedSearch(event.target.value)} placeholder="Search imported items" />
+            </Field>
+            <Field label="Type filter">
+              <select className="field w-full" value={importedTypeFilter} onChange={event => setImportedTypeFilter(event.target.value)}>
+                {importedTypeOptions.map(option => <option key={option || 'all-types'} value={option}>{option || 'All types'}</option>)}
+              </select>
+            </Field>
+            <Field label="State filter">
+              <select className="field w-full" value={importedStateFilter} onChange={event => setImportedStateFilter(event.target.value)}>
+                {importedStateOptions.map(option => <option key={option || 'all-states'} value={option}>{option || 'All states'}</option>)}
+              </select>
+            </Field>
+            <div className="flex items-end">
+              <Button type="button" size="sm" onClick={applyImportedFilters}>Filter</Button>
+            </div>
+          </div>
+          <div className="mt-4 overflow-x-auto rounded-xl border border-slate-100">
+            <table className="min-w-full divide-y divide-slate-100 text-left text-[11px]">
+              <thead className="bg-slate-50 text-slate-500">
+                <tr>
+                  <th className="px-3 py-2 font-semibold">ID</th>
+                  <th className="px-3 py-2 font-semibold">Title</th>
+                  <th className="px-3 py-2 font-semibold">Type</th>
+                  <th className="px-3 py-2 font-semibold">State</th>
+                  <th className="px-3 py-2 font-semibold">Imported At</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 bg-white text-slate-700">
+                {importedItemsResponse?.items.map(item => <Fragment key={item.document_id}>
+                  <tr className="hover:bg-slate-50">
+                    <td className="whitespace-nowrap px-3 py-2 font-semibold text-slate-900">
+                      <button type="button" className="inline-flex items-center gap-1 text-left text-blue-600 hover:text-blue-700" onClick={() => setExpandedImportedDocumentId(current => current === item.document_id ? null : item.document_id)} aria-expanded={expandedImportedDocumentId === item.document_id}>
+                        <ChevronRight size={13} className={expandedImportedDocumentId === item.document_id ? 'rotate-90' : ''} />
+                        {item.work_item_id}
+                      </button>
+                    </td>
+                    <td className="min-w-64 px-3 py-2 text-slate-900">{item.title}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{item.work_item_type || 'Unknown'}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{item.state || 'Unknown'}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{formatImportedDate(item.imported_at)}</td>
+                  </tr>
+                  {expandedImportedDocumentId === item.document_id && <tr>
+                    <td colSpan={5} className="bg-slate-50 px-3 py-3">
+                      <dl className="grid gap-2 text-[11px] sm:grid-cols-2">
+                        {Object.entries(item.metadata).map(([key, value]) => <div key={key} className="min-w-0 rounded-lg bg-white px-3 py-2">
+                          <dt className="font-semibold text-slate-500">{key}</dt>
+                          <dd className="mt-1 break-words text-slate-800">{String(value ?? '')}</dd>
+                        </div>)}
+                      </dl>
+                    </td>
+                  </tr>}
+                </Fragment>)}
+                {!loadingImportedWorkItems && importedItemsResponse && !importedItemsResponse.items.length && <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400">No imported work items found.</td></tr>}
+                {loadingImportedWorkItems && <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400">Loading imported work items...</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-[11px] text-slate-500">
+            <p>Showing {importedRangeStart} to {importedRangeEnd} of {importedTotal} items</p>
+            <div className="flex items-center gap-2">
+              <Button type="button" size="sm" variant="secondary" disabled={importedPage <= 1 || loadingImportedWorkItems} onClick={() => setImportedPage(page => Math.max(1, page - 1))}>Previous</Button>
+              <span>Page {importedPage}</span>
+              <Button type="button" size="sm" variant="secondary" disabled={!importedHasNextPage || loadingImportedWorkItems} onClick={() => setImportedPage(page => page + 1)}>Next</Button>
+            </div>
+          </div>
+        </Card>}
         <Card className="mt-4 border-[#e6ecf5] p-4 shadow-[0_5px_18px_rgba(37,99,235,.04)]">
           <h3 className="text-sm font-semibold text-slate-900">Source</h3>
           <p className="mt-1 text-[11px] text-slate-500">Select the data you want to import.</p>
@@ -641,6 +775,13 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     </div>}
 
   </div>
+}
+
+// Formats imported Azure timestamps while keeping empty values explicit.
+function formatImportedDate(value?: string | null) {
+  if (!value) return 'Not synced'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
 // Keeps form labels and controls consistent while allowing integrations to add different control types later.

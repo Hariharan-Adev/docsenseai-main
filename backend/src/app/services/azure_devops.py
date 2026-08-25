@@ -80,6 +80,30 @@ class AzureDevOpsSyncResult:
     items: list[AzureDevOpsSyncItem]
 
 
+@dataclass(frozen=True)
+class AzureDevOpsImportedItem:
+    """Read-only view of one already-imported Azure Boards work item."""
+
+    document_id: int
+    work_item_id: int
+    title: str
+    work_item_type: str
+    state: str
+    imported_at: str
+    metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AzureDevOpsImportedItemsResult:
+    """Paginated list and summary for imported Azure Boards items."""
+
+    total: int
+    page: int
+    page_size: int
+    last_synced_at: str | None
+    items: list[AzureDevOpsImportedItem]
+
+
 def normalize_organization_url(value: str) -> tuple[str, str]:
     """Accept only https://dev.azure.com/{organization} URLs before calling Azure."""
     parsed = urlparse(value.strip())
@@ -179,6 +203,12 @@ def _clean_field_text(value: object) -> str:
     text = re.sub(r"(?i)</p\s*>", "\n", text)
     text = re.sub(r"<[^>]+>", " ", text)
     return " ".join(unescape(text).split())
+
+
+def _line_value(text: str, label: str) -> str:
+    """Read one stored field line from imported Azure chunk text."""
+    match = re.search(rf"(?m)^{re.escape(label)}:\s*(.+)$", text)
+    return match.group(1).strip() if match else ""
 
 
 def _validate_field_name(field_name: str) -> str:
@@ -622,4 +652,83 @@ def sync_work_items(
         imported_count=len(imported),
         skipped_count=skipped,
         items=imported,
+    )
+
+
+def list_imported_work_items(
+    *,
+    owner_id: int,
+    organization_id: str,
+    search: str = "",
+    work_item_type: str = "",
+    state: str = "",
+    page: int = 1,
+    page_size: int = 10,
+) -> AzureDevOpsImportedItemsResult:
+    """Return imported Azure Boards items from existing indexed RAG records."""
+    page = max(1, page)
+    page_size = min(max(1, page_size), 50)
+    with get_connection() as connection:
+        rows = connection.execute(
+            """SELECT d.id AS document_id, d.display_filename, d.updated_at,
+                      dv.completed_at, c.text, c.source_location_json
+               FROM documents d
+               JOIN chunks c
+                 ON c.document_id = d.id
+                AND c.version_id = d.current_version_id
+                AND c.organization_id = d.organization_id
+               JOIN document_versions dv
+                 ON dv.id = d.current_version_id
+                AND dv.organization_id = d.organization_id
+               WHERE d.organization_id = ? AND d.owner_id = ?
+                 AND d.deleted_at IS NULL AND c.deleted_at IS NULL
+                 AND c.source_type = 'azure_devops'
+               ORDER BY COALESCE(dv.completed_at, d.updated_at, d.uploaded_at) DESC,
+                        d.id DESC""",
+            (organization_id, owner_id),
+        ).fetchall()
+
+    items: list[AzureDevOpsImportedItem] = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["source_location_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        text = str(row["text"] or "")
+        raw_work_item_id = metadata.get("work_item_id")
+        try:
+            work_item_id = int(raw_work_item_id)
+        except (TypeError, ValueError):
+            continue
+        title = _line_value(text, "Title") or str(row["display_filename"] or "")
+        imported_type = _line_value(text, "System.WorkItemType")
+        imported_state = _line_value(text, "System.State")
+        imported_at = str(row["completed_at"] or row["updated_at"] or "")
+        item = AzureDevOpsImportedItem(
+            document_id=int(row["document_id"]),
+            work_item_id=work_item_id,
+            title=title,
+            work_item_type=imported_type,
+            state=imported_state,
+            imported_at=imported_at,
+            metadata=metadata,
+        )
+        query = search.strip().casefold()
+        if query and query not in item.title.casefold() and query not in str(work_item_id):
+            continue
+        if work_item_type.strip() and item.work_item_type != work_item_type.strip():
+            continue
+        if state.strip() and item.state != state.strip():
+            continue
+        items.append(item)
+
+    start = (page - 1) * page_size
+    paged = items[start:start + page_size]
+    last_synced = max((item.imported_at for item in items if item.imported_at), default=None)
+    return AzureDevOpsImportedItemsResult(
+        total=len(items),
+        page=page,
+        page_size=page_size,
+        last_synced_at=last_synced,
+        items=paged,
     )

@@ -16,8 +16,11 @@ from app.main import app
 from app.services import azure_devops
 from app.services.azure_devops import (
     AzureDevOpsConnectionError,
+    AzureDevOpsImportedItem,
+    AzureDevOpsImportedItemsResult,
     AzureDevOpsProject,
     AzureDevOpsValidationResult,
+    list_imported_work_items,
     normalize_organization_url,
     sync_work_items,
     validate_connection,
@@ -207,7 +210,7 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                         body = json.loads(request.content.decode("utf-8"))
                         self.assertEqual(
                             body["fields"],
-                            ["System.Description", "System.State", "System.Title"],
+                            ["System.Description", "System.State", "System.Title", "System.WorkItemType"],
                         )
                         return httpx.Response(
                             200,
@@ -218,6 +221,7 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                                         "System.Title": "Login bug",
                                         "System.Description": "<p>Login fails on submit</p>",
                                         "System.State": "Active",
+                                        "System.WorkItemType": "Bug",
                                     },
                                 }]
                             },
@@ -253,7 +257,7 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                         states=["Active"],
                         title_field="System.Title",
                         content_field="System.Description",
-                        metadata_fields=["System.State"],
+                        metadata_fields=["System.State", "System.WorkItemType"],
                         owner_id=1,
                         organization_id="org-a",
                     )
@@ -271,9 +275,22 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                 self.assertEqual(chunk["indexing_status"], "completed")
                 self.assertIn("Content: Login fails on submit", chunk["text"])
                 self.assertIn("System.State: Active", chunk["text"])
+                self.assertIn("System.WorkItemType: Bug", chunk["text"])
                 location = json.loads(chunk["source_location_json"])
                 self.assertEqual(location["project_name"], "Hunt")
                 self.assertEqual(location["work_item_id"], 101)
+
+                imported = list_imported_work_items(
+                    owner_id=1,
+                    organization_id="org-a",
+                    search="101",
+                    work_item_type="Bug",
+                    state="Active",
+                )
+                self.assertEqual(imported.total, 1)
+                self.assertEqual(imported.items[0].title, "Login bug")
+                self.assertEqual(imported.items[0].work_item_type, "Bug")
+                self.assertEqual(imported.items[0].state, "Active")
 
 
 class AzureDevOpsRouteTests(unittest.TestCase):
@@ -341,6 +358,45 @@ class AzureDevOpsRouteTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["detail"]["code"], "pat_authentication_failed")
         self.assertNotIn("secret-pat", str(body))
+
+    def test_imported_items_endpoint_returns_existing_sync_rows(self) -> None:
+        """The configuration page receives paginated imported Azure item data."""
+        result = AzureDevOpsImportedItemsResult(
+            total=1,
+            page=1,
+            page_size=10,
+            last_synced_at="2026-08-25 10:50:00",
+            items=[
+                AzureDevOpsImportedItem(
+                    document_id=10,
+                    work_item_id=101,
+                    title="Login bug",
+                    work_item_type="Bug",
+                    state="Active",
+                    imported_at="2026-08-25 10:50:00",
+                    metadata={"project_name": "Hunt", "work_item_id": 101},
+                )
+            ],
+        )
+        with patch("app.routes.azure_devops.list_imported_work_items", return_value=result) as imported:
+            response = self.client.get(
+                "/integrations/azure-devops/imported-items",
+                params={"search": "login", "work_item_type": "Bug", "state": "Active"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["work_item_id"], 101)
+        imported.assert_called_once_with(
+            owner_id=1,
+            organization_id="org-a",
+            search="login",
+            work_item_type="Bug",
+            state="Active",
+            page=1,
+            page_size=10,
+        )
 
 
 if __name__ == "__main__":

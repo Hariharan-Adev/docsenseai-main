@@ -106,6 +106,24 @@ export interface AzureDevOpsSyncResponse {
   }>
 }
 
+export interface AzureDevOpsImportedItem {
+  document_id: number
+  work_item_id: number
+  title: string
+  work_item_type: string
+  state: string
+  imported_at: string
+  metadata: Record<string, unknown>
+}
+
+export interface AzureDevOpsImportedItemsResponse {
+  total: number
+  page: number
+  page_size: number
+  last_synced_at: string | null
+  items: AzureDevOpsImportedItem[]
+}
+
 export interface FolderRecord {
   id: string
   name: string
@@ -550,6 +568,25 @@ export async function syncAzureDevOpsWorkItems(payload: AzureDevOpsSyncRequest) 
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(payload),
+  })
+}
+
+export async function listAzureDevOpsImportedItems(params: {
+  search?: string
+  work_item_type?: string
+  state?: string
+  page?: number
+  page_size?: number
+}) {
+  const query = new URLSearchParams()
+  if (params.search) query.set('search', params.search)
+  if (params.work_item_type) query.set('work_item_type', params.work_item_type)
+  if (params.state) query.set('state', params.state)
+  if (params.page) query.set('page', String(params.page))
+  if (params.page_size) query.set('page_size', String(params.page_size))
+  return requestJson<AzureDevOpsImportedItemsResponse>(`/integrations/azure-devops/imported-items?${query.toString()}`, {
+    method: 'GET',
+    headers: authHeaders(),
   })
 }
 
