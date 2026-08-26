@@ -1,7 +1,7 @@
 import { Building2, ChevronLeft, ChevronRight, ChevronUp, Cloud, CloudCog, Eye, EyeOff, Github, Plus, Search } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useApp } from '../context/AppContext'
-import { ApiError, listAzureDevOpsImportedItems, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsImportedItemsResponse, type AzureDevOpsProject } from '../services/api'
+import { ApiError, disconnectAzureDevOpsConnection, getAzureDevOpsConnection, listAzureDevOpsImportedItems, syncAzureDevOpsWorkItems, testAzureDevOpsConnection, type AzureDevOpsConnectionResponse, type AzureDevOpsImportedItemsResponse, type AzureDevOpsProject } from '../services/api'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
 
@@ -62,6 +62,8 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [organizationUrl, setOrganizationUrl] = useState('')
   const [personalAccessToken, setPersonalAccessToken] = useState('')
   const [showToken, setShowToken] = useState(false)
+  const [savedAzureToken, setSavedAzureToken] = useState(false)
+  const [updatingAzureToken, setUpdatingAzureToken] = useState(false)
   const [selectedProject, setSelectedProject] = useState('')
   const [workItemTypes, setWorkItemTypes] = useState(['Bug', 'User Story'])
   const [states, setStates] = useState(['New', 'Active'])
@@ -124,14 +126,55 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
 
   const visibleIntegrations = integrationCatalog.filter(integration => integration.name.toLowerCase().includes(integrationSearch.trim().toLowerCase()))
 
+  // Applies persisted Azure state without ever placing the saved PAT into React state.
+  const applySavedAzureConnection = (result: AzureDevOpsConnectionResponse) => {
+    setOrganizationUrl(result.organization_url)
+    setPersonalAccessToken('')
+    setSavedAzureToken(result.token_saved)
+    setUpdatingAzureToken(false)
+    setShowToken(false)
+    setAzureDevProjects(result.projects)
+    setSelectedProject(result.projects[0]?.id ?? '')
+    setAzureDevConnected(result.connected && result.projects.length > 0)
+    setAzureDevConnectionMessage(result.message || (result.token_saved ? 'Token saved.' : 'Use Test Connection to verify the current credentials.'))
+    if (result.connected && result.projects.length > 0) void refreshImportedAzureItemCount()
+  }
+
+  useEffect(() => {
+    getAzureDevOpsConnection()
+      .then(applySavedAzureConnection)
+      .catch(error => {
+        const message = error instanceof ApiError ? error.message : 'Saved Azure DevOps connection could not be loaded.'
+        setAzureDevConnectionMessage(message)
+      })
+  }, [])
+
   // Credential edits invalidate the previous live Azure DevOps verification.
   const updateAzureCredentials = (field: 'organizationUrl' | 'personalAccessToken', value: string) => {
-    if (field === 'organizationUrl') setOrganizationUrl(value)
-    else setPersonalAccessToken(value)
+    if (field === 'organizationUrl') {
+      setOrganizationUrl(value)
+      setSavedAzureToken(false)
+      setUpdatingAzureToken(true)
+      setPersonalAccessToken('')
+      setShowToken(false)
+    }
+    else {
+      setPersonalAccessToken(value)
+      setUpdatingAzureToken(true)
+    }
     setAzureDevConnected(false)
     setAzureDevProjects([])
     setSelectedProject('')
-    setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
+    setAzureDevConnectionMessage(field === 'personalAccessToken' ? 'Test the replacement token before syncing.' : 'Use Test Connection to verify the current credentials.')
+  }
+
+  // Makes replacing a saved PAT an explicit action so the stored token is never revealable.
+  const startAzureTokenReplacement = () => {
+    setPersonalAccessToken('')
+    setShowToken(false)
+    setUpdatingAzureToken(true)
+    setAzureDevConnected(false)
+    setAzureDevConnectionMessage('Enter a replacement token, then test the connection.')
   }
 
   // Updates a checkbox group without duplicating values.
@@ -144,6 +187,8 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setOrganizationUrl('')
     setPersonalAccessToken('')
     setShowToken(false)
+    setSavedAzureToken(false)
+    setUpdatingAzureToken(false)
     setSelectedProject('')
     setAzureDevConnected(false)
     setAzureDevProjects([])
@@ -218,7 +263,8 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   // Calls the backend so Connected means Azure DevOps returned projects for this PAT.
   const handleTestAzureConnection = async () => {
     if (testingAzureDevConnection) return
-    if (!organizationUrl.trim() || !personalAccessToken.trim()) {
+    const usingSavedToken = savedAzureToken && !updatingAzureToken
+    if (!organizationUrl.trim() || (!usingSavedToken && !personalAccessToken.trim())) {
       showToast('Enter an Azure DevOps organization URL and personal access token')
       return
     }
@@ -228,8 +274,12 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setAzureDevProjects([])
     setSelectedProject('')
     try {
-      const result = await testAzureDevOpsConnection(organizationUrl, personalAccessToken)
+      const result = await testAzureDevOpsConnection(organizationUrl, usingSavedToken ? '' : personalAccessToken)
       setOrganizationUrl(result.organization_url)
+      setPersonalAccessToken('')
+      setSavedAzureToken(result.token_saved)
+      setUpdatingAzureToken(false)
+      setShowToken(false)
       setAzureDevProjects(result.projects)
       setSelectedProject(result.projects[0]?.id ?? '')
       setAzureDevConnected(result.connected && result.projects.length > 0)
@@ -248,7 +298,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const handleSyncAzureWorkItems = async () => {
     if (syncingAzureDevWorkItems) return
     const project = azureDevProjects.find(item => item.id === selectedProject)
-    if (!organizationUrl.trim() || !personalAccessToken.trim() || !azureDevConnected || !project) {
+    if (!organizationUrl.trim() || !savedAzureToken || updatingAzureToken || !azureDevConnected || !project) {
       showToast('Test the Azure DevOps connection and select a project before syncing')
       return
     }
@@ -260,7 +310,6 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     try {
       const result = await syncAzureDevOpsWorkItems({
         organization_url: organizationUrl,
-        personal_access_token: personalAccessToken,
         project_id: project.id,
         project_name: project.name,
         work_item_types: workItemTypes,
@@ -351,11 +400,14 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setPendingConfirmation({ integrationId: id, action })
   }
 
-  const handleConfirmationAction = () => {
+  const handleConfirmationAction = async () => {
     if (!pendingConfirmation) return
 
     if (pendingConfirmation.action === 'disconnect') {
-      if (pendingConfirmation.integrationId === 'azure-dev') setAzureDevConnected(false)
+      if (pendingConfirmation.integrationId === 'azure-dev') {
+        await disconnectAzureDevOpsConnection()
+        cancelAzureChanges()
+      }
       else {
         setSavedGitHubConfiguration(current => current ? { ...current, connected: false } : current)
         setGitHubDraft(current => ({ ...current, connected: false }))
@@ -364,8 +416,14 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
 
     if (pendingConfirmation.action === 'reconnect') {
       if (pendingConfirmation.integrationId === 'azure-dev') {
-        setAzureDevConnected(false)
-        setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
+        try {
+          applySavedAzureConnection(await testAzureDevOpsConnection(organizationUrl, ''))
+        } catch (error) {
+          const message = error instanceof ApiError ? error.message : 'Azure DevOps connection test failed.'
+          setAzureDevConnected(false)
+          setAzureDevConnectionMessage(message)
+          showToast(message)
+        }
       }
       else {
         setSavedGitHubConfiguration(current => current ? { ...current, connected: true } : current)
@@ -375,6 +433,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
 
     if (pendingConfirmation.action === 'delete') {
       if (pendingConfirmation.integrationId === 'azure-dev') {
+        await disconnectAzureDevOpsConnection()
         setAzureDevDeleted(true)
         if (selectedIntegration === 'azure-dev') selectIntegration('catalog')
         cancelAzureChanges()
@@ -458,12 +517,15 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
               <input className="field w-full" type="url" value={organizationUrl} onChange={event => updateAzureCredentials('organizationUrl', event.target.value)} placeholder="https://dev.azure.com/organization" />
             </Field>
             <Field label="Personal Access Token">
-              <div className="relative">
-                <input className="field w-full pr-10" type={showToken ? 'text' : 'password'} value={personalAccessToken} onChange={event => updateAzureCredentials('personalAccessToken', event.target.value)} autoComplete="off" />
+              {savedAzureToken && !updatingAzureToken ? <div className="flex min-h-10 items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <span className="text-[12px] font-medium text-slate-700">Token saved</span>
+                <button type="button" onClick={startAzureTokenReplacement} className="text-[11px] font-semibold text-blue-600 hover:text-blue-700">Replace token</button>
+              </div> : <div className="relative">
+                <input className="field w-full pr-10" type={showToken ? 'text' : 'password'} value={personalAccessToken} onChange={event => updateAzureCredentials('personalAccessToken', event.target.value)} autoComplete="new-password" placeholder={savedAzureToken ? 'Enter replacement token' : ''} />
                 <button type="button" onClick={() => setShowToken(current => !current)} className="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-slate-400 hover:bg-slate-50 hover:text-blue-600" aria-label={showToken ? 'Hide personal access token' : 'Show personal access token'}>
                   {showToken ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
-              </div>
+              </div>}
             </Field>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -535,11 +597,25 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
                   </tr>
                   {expandedImportedDocumentId === item.document_id && <tr>
                     <td colSpan={5} className="bg-slate-50 px-3 py-3">
-                      <dl className="grid gap-2 text-[11px] sm:grid-cols-2">
-                        {Object.entries(item.metadata).map(([key, value]) => <div key={key} className="min-w-0 rounded-lg bg-white px-3 py-2">
-                          <dt className="font-semibold text-slate-500">{key}</dt>
-                          <dd className="mt-1 break-words text-slate-800">{String(value ?? '')}</dd>
-                        </div>)}
+                      <dl className="grid gap-3 rounded-lg bg-white px-3 py-3 text-[11px] text-slate-700">
+                        <div className="grid gap-1 sm:grid-cols-[120px_1fr]">
+                          <dt className="font-semibold text-slate-500">Work item ID</dt>
+                          <dd className="break-words text-slate-900">{item.work_item_id}</dd>
+                        </div>
+                        <div className="grid gap-1 sm:grid-cols-[120px_1fr]">
+                          <dt className="font-semibold text-slate-500">Title</dt>
+                          <dd className="break-words text-slate-900">{item.title}</dd>
+                        </div>
+                        <div className="grid gap-1 sm:grid-cols-[120px_1fr]">
+                          <dt className="font-semibold text-slate-500">Description</dt>
+                          <dd className="whitespace-pre-wrap break-words leading-5 text-slate-800">{item.description || 'No description available.'}</dd>
+                        </div>
+                        <div className="grid gap-1 sm:grid-cols-[120px_1fr]">
+                          <dt className="font-semibold text-slate-500">Azure DevOps URL</dt>
+                          <dd className="min-w-0">
+                            {item.azure_url ? <a className="break-all text-blue-600 hover:text-blue-700 hover:underline" href={item.azure_url} target="_blank" rel="noreferrer">{item.azure_url}</a> : <span className="text-slate-400">No URL available.</span>}
+                          </dd>
+                        </div>
                       </dl>
                     </td>
                   </tr>}

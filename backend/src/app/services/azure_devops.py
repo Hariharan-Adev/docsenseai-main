@@ -1,6 +1,6 @@
 """Azure DevOps connection validation and work-item import helpers."""
 
-from base64 import b64encode
+from base64 import b64encode, urlsafe_b64encode
 from dataclasses import dataclass
 from hashlib import sha256
 from html import unescape
@@ -10,6 +10,7 @@ import sqlite3
 from urllib.parse import urlparse
 from urllib.parse import quote
 
+from cryptography.fernet import Fernet, InvalidToken
 import httpx
 
 from app.config import settings
@@ -61,6 +62,18 @@ class AzureDevOpsValidationResult:
 
 
 @dataclass(frozen=True)
+class AzureDevOpsSavedConnection:
+    """Saved Azure DevOps configuration summary that never includes the PAT."""
+
+    organization_url: str
+    projects: list[AzureDevOpsProject]
+    checks: list[str]
+    connected: bool
+    token_saved: bool
+    last_tested_at: str | None
+
+
+@dataclass(frozen=True)
 class AzureDevOpsSyncItem:
     """One Azure Boards work item normalized for knowledge-base indexing."""
 
@@ -87,10 +100,11 @@ class AzureDevOpsImportedItem:
     document_id: int
     work_item_id: int
     title: str
+    description: str
+    azure_url: str
     work_item_type: str
     state: str
     imported_at: str
-    metadata: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -135,6 +149,70 @@ def _auth_header(personal_access_token: str) -> str:
             "Enter an Azure DevOps personal access token.",
         )
     return "Basic " + b64encode(f":{token}".encode("utf-8")).decode("ascii")
+
+
+def _credential_cipher() -> Fernet:
+    """Create a stable server-side cipher for stored Azure DevOps PAT values."""
+    secret = settings.jwt_secret_key or settings.rate_limit_salt
+    if not secret and settings.app_environment == "production":
+        raise AzureDevOpsConnectionError(
+            500,
+            "credential_key_missing",
+            "Azure DevOps credentials cannot be stored until server credential encryption is configured.",
+        )
+    key_material = (secret or "docsense-ai-development-credential-key").encode("utf-8")
+    return Fernet(urlsafe_b64encode(sha256(key_material).digest()))
+
+
+def _encrypt_pat(personal_access_token: str) -> str:
+    """Encrypt a PAT before writing it to SQLite."""
+    return _credential_cipher().encrypt(personal_access_token.strip().encode("utf-8")).decode("ascii")
+
+
+def _decrypt_pat(encrypted_pat: str) -> str:
+    """Decrypt a stored PAT or return a safe connection error if it is unreadable."""
+    try:
+        return _credential_cipher().decrypt(encrypted_pat.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeError, ValueError) as error:
+        raise AzureDevOpsConnectionError(
+            500,
+            "stored_pat_unreadable",
+            "The saved Azure DevOps token cannot be read. Update the token to reconnect.",
+        ) from error
+
+
+def _projects_from_json(value: str) -> list[AzureDevOpsProject]:
+    """Parse persisted project options while ignoring malformed rows safely."""
+    try:
+        raw_projects = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        raw_projects = []
+    return [
+        AzureDevOpsProject(id=str(item["id"]), name=str(item["name"]))
+        for item in raw_projects
+        if isinstance(item, dict) and item.get("id") and item.get("name")
+    ]
+
+
+def _checks_from_json(value: str) -> list[str]:
+    """Parse persisted validation checks as display-safe strings."""
+    try:
+        raw_checks = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        raw_checks = []
+    return [str(item) for item in raw_checks if isinstance(item, str)]
+
+
+def _saved_connection_from_row(row: sqlite3.Row) -> AzureDevOpsSavedConnection:
+    """Convert a saved connection row into the non-secret API contract."""
+    return AzureDevOpsSavedConnection(
+        organization_url=str(row["organization_url"] or ""),
+        projects=_projects_from_json(str(row["projects_json"] or "[]")),
+        checks=_checks_from_json(str(row["checks_json"] or "[]")),
+        connected=bool(row["connected"]),
+        token_saved=bool(row["encrypted_pat"]),
+        last_tested_at=str(row["last_tested_at"]) if row["last_tested_at"] else None,
+    )
 
 
 def _azure_error_message(response: httpx.Response) -> str:
@@ -209,6 +287,25 @@ def _line_value(text: str, label: str) -> str:
     """Read one stored field line from imported Azure chunk text."""
     match = re.search(rf"(?m)^{re.escape(label)}:\s*(.+)$", text)
     return match.group(1).strip() if match else ""
+
+
+def _imported_work_item_url(metadata: dict[str, object], work_item_id: int) -> str:
+    """Return the stored Azure dashboard URL, rebuilding it from safe metadata when absent."""
+    raw_url = str(metadata.get("url") or "")
+    parsed = urlparse(raw_url)
+    if (
+        parsed.scheme == "https"
+        and parsed.netloc.lower() == "dev.azure.com"
+        and parsed.path.rstrip("/").endswith(f"/_workitems/edit/{work_item_id}")
+    ):
+        return raw_url
+    organization_url = str(metadata.get("organization_url") or "")
+    project_name = str(metadata.get("project_name") or "")
+    try:
+        normalized_url, _organization = normalize_organization_url(organization_url)
+    except AzureDevOpsConnectionError:
+        return ""
+    return _work_item_url(normalized_url, project_name, work_item_id) if project_name else ""
 
 
 def _validate_field_name(field_name: str) -> str:
@@ -552,6 +649,127 @@ def validate_connection(organization_url: str, personal_access_token: str) -> Az
     )
 
 
+def get_saved_connection(*, owner_id: int, organization_id: str) -> AzureDevOpsSavedConnection | None:
+    """Return the saved Azure DevOps connection summary without decrypting the PAT."""
+    with get_connection() as connection:
+        row = connection.execute(
+            """SELECT organization_url, encrypted_pat, projects_json, checks_json,
+                      connected, last_tested_at
+               FROM azure_devops_connections
+               WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+               ORDER BY updated_at DESC LIMIT 1""",
+            (organization_id, owner_id),
+        ).fetchone()
+    return _saved_connection_from_row(row) if row else None
+
+
+def save_validated_connection(
+    *,
+    owner_id: int,
+    organization_id: str,
+    organization_url: str,
+    personal_access_token: str,
+) -> AzureDevOpsSavedConnection:
+    """Validate Azure DevOps credentials and persist the PAT encrypted on success."""
+    result = validate_connection(organization_url, personal_access_token)
+    projects_json = json.dumps([project.__dict__ for project in result.projects])
+    checks_json = json.dumps(result.checks)
+    encrypted_pat = _encrypt_pat(personal_access_token)
+    with get_connection() as connection:
+        connection.execute(
+            """INSERT INTO azure_devops_connections
+               (organization_id, user_id, organization_url, encrypted_pat,
+                projects_json, checks_json, connected, last_tested_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+               ON CONFLICT(organization_id, user_id) WHERE deleted_at IS NULL
+               DO UPDATE SET organization_url = excluded.organization_url,
+                             encrypted_pat = excluded.encrypted_pat,
+                             projects_json = excluded.projects_json,
+                             checks_json = excluded.checks_json,
+                             connected = 1,
+                             last_tested_at = CURRENT_TIMESTAMP,
+                             updated_at = CURRENT_TIMESTAMP""",
+            (
+                organization_id,
+                owner_id,
+                result.organization_url,
+                encrypted_pat,
+                projects_json,
+                checks_json,
+            ),
+        )
+    saved = get_saved_connection(owner_id=owner_id, organization_id=organization_id)
+    if saved is None:
+        raise AzureDevOpsConnectionError(500, "connection_save_failed", "Azure DevOps connection could not be saved.")
+    return saved
+
+
+def validate_saved_connection(*, owner_id: int, organization_id: str) -> AzureDevOpsSavedConnection:
+    """Re-test the saved PAT and update connection status without exposing the token."""
+    with get_connection() as connection:
+        row = connection.execute(
+            """SELECT organization_url, encrypted_pat
+               FROM azure_devops_connections
+               WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+               ORDER BY updated_at DESC LIMIT 1""",
+            (organization_id, owner_id),
+        ).fetchone()
+    if row is None:
+        raise AzureDevOpsConnectionError(404, "azure_connection_not_found", "Save an Azure DevOps connection first.")
+
+    try:
+        pat = _decrypt_pat(str(row["encrypted_pat"] or ""))
+        result = validate_connection(str(row["organization_url"] or ""), pat)
+    except AzureDevOpsConnectionError:
+        with get_connection() as connection:
+            connection.execute(
+                """UPDATE azure_devops_connections
+                   SET connected = 0, last_tested_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL""",
+                (organization_id, owner_id),
+            )
+        raise
+
+    return save_validated_connection(
+        owner_id=owner_id,
+        organization_id=organization_id,
+        organization_url=result.organization_url,
+        personal_access_token=pat,
+    )
+
+
+def delete_saved_connection(*, owner_id: int, organization_id: str) -> None:
+    """Soft-delete the saved Azure DevOps connection and encrypted PAT."""
+    with get_connection() as connection:
+        connection.execute(
+            """UPDATE azure_devops_connections
+               SET deleted_at = CURRENT_TIMESTAMP, connected = 0,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL""",
+            (organization_id, owner_id),
+        )
+
+
+def _saved_pat_for_sync(*, owner_id: int, organization_id: str) -> tuple[str, str]:
+    """Read the saved PAT for server-side sync without returning it to the frontend."""
+    with get_connection() as connection:
+        row = connection.execute(
+            """SELECT organization_url, encrypted_pat, connected
+               FROM azure_devops_connections
+               WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+               ORDER BY updated_at DESC LIMIT 1""",
+            (organization_id, owner_id),
+        ).fetchone()
+    if row is None or not row["connected"]:
+        raise AzureDevOpsConnectionError(
+            401,
+            "saved_azure_connection_required",
+            "Test or update the saved Azure DevOps token before syncing.",
+        )
+    return str(row["organization_url"] or ""), _decrypt_pat(str(row["encrypted_pat"] or ""))
+
+
 def sync_work_items(
     *,
     organization_url: str,
@@ -567,6 +785,11 @@ def sync_work_items(
     organization_id: str,
 ) -> AzureDevOpsSyncResult:
     """Fetch selected Azure Boards work items and index them for retrieval."""
+    if not personal_access_token.strip():
+        organization_url, personal_access_token = _saved_pat_for_sync(
+            owner_id=owner_id,
+            organization_id=organization_id,
+        )
     normalized_url, _organization = normalize_organization_url(organization_url)
     title_field = _validate_field_name(title_field)
     content_field = _validate_field_name(content_field)
@@ -708,10 +931,11 @@ def list_imported_work_items(
             document_id=int(row["document_id"]),
             work_item_id=work_item_id,
             title=title,
+            description=_line_value(text, "Content"),
+            azure_url=_imported_work_item_url(metadata, work_item_id),
             work_item_type=imported_type,
             state=imported_state,
             imported_at=imported_at,
-            metadata=metadata,
         )
         query = search.strip().casefold()
         if query and query not in item.title.casefold() and query not in str(work_item_id):

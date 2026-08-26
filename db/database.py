@@ -1289,6 +1289,39 @@ def _migrate_project_folders_v16(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_azure_devops_connections_v17(connection: sqlite3.Connection) -> None:
+    """Persist one encrypted Azure DevOps connection per user and organization."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS azure_devops_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            organization_url TEXT NOT NULL CHECK (length(trim(organization_url)) BETWEEN 1 AND 300),
+            encrypted_pat TEXT NOT NULL,
+            projects_json TEXT NOT NULL DEFAULT '[]',
+            checks_json TEXT NOT NULL DEFAULT '[]',
+            connected INTEGER NOT NULL DEFAULT 0 CHECK (connected IN (0, 1)),
+            last_tested_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TEXT,
+            FOREIGN KEY (organization_id) REFERENCES organizations(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_azure_devops_connections_active_user
+            ON azure_devops_connections(organization_id, user_id)
+            WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_azure_devops_connections_owner
+            ON azure_devops_connections(organization_id, user_id, deleted_at, updated_at);
+        """
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('017_azure_devops_connection_persistence')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1367,6 +1400,7 @@ def initialize_database() -> None:
             _migrate_unique_active_user_email_v14(connection)
             _migrate_projects_v15(connection)
             _migrate_project_folders_v16(connection)
+            _migrate_azure_devops_connections_v17(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

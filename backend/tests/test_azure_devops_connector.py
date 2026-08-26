@@ -20,8 +20,10 @@ from app.services.azure_devops import (
     AzureDevOpsImportedItemsResult,
     AzureDevOpsProject,
     AzureDevOpsValidationResult,
+    get_saved_connection,
     list_imported_work_items,
     normalize_organization_url,
+    save_validated_connection,
     sync_work_items,
     validate_connection,
 )
@@ -289,8 +291,125 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(imported.total, 1)
                 self.assertEqual(imported.items[0].title, "Login bug")
+                self.assertEqual(imported.items[0].description, "Login fails on submit")
+                self.assertEqual(
+                    imported.items[0].azure_url,
+                    "https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/101",
+                )
                 self.assertEqual(imported.items[0].work_item_type, "Bug")
                 self.assertEqual(imported.items[0].state, "Active")
+
+    def test_imported_items_rebuilds_mismatched_stored_url(self) -> None:
+        """Displayed Azure links must point to the selected imported work item."""
+        class FakeVectorStore:
+            """Capture indexed points without requiring a running Qdrant instance."""
+
+            def __init__(self) -> None:
+                self.points = []
+
+            def upsert_chunks(self, points) -> None:
+                self.points.extend(points)
+
+        store = FakeVectorStore()
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "azure-url.db"
+            with patch.object(database, "DATABASE_PATH", database_path):
+                database.initialize_database()
+                with database.get_connection() as connection:
+                    connection.execute(
+                        "INSERT INTO organizations (id, name) VALUES ('org-a', 'Org A')"
+                    )
+                    connection.execute(
+                        """INSERT INTO users
+                           (id, email, password_hash, organization_id, role)
+                           VALUES (1, 'owner@example.com', 'hash', 'org-a',
+                                   'organization_admin')"""
+                    )
+
+                with patch.object(azure_devops, "create_embeddings", return_value=[[1.0] + [0.0] * 383]), \
+                    patch.object(azure_devops, "get_vector_store", return_value=store):
+                    azure_devops._index_work_item(
+                        organization_id="org-a",
+                        owner_id=1,
+                        organization_url="https://dev.azure.com/Laserbeamch",
+                        project_id="project-1",
+                        project_name="Hunt",
+                        title_field="System.Title",
+                        content_field="System.Description",
+                        metadata_fields=["System.State", "System.WorkItemType"],
+                        item={
+                            "id": 101,
+                            "fields": {
+                                "System.Title": "Login bug",
+                                "System.Description": "Login fails on submit",
+                                "System.State": "Active",
+                                "System.WorkItemType": "Bug",
+                            },
+                        },
+                    )
+                with database.get_connection() as connection:
+                    location = json.loads(connection.execute(
+                        "SELECT source_location_json FROM chunks"
+                    ).fetchone()["source_location_json"])
+                    location["url"] = "https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/999"
+                    connection.execute(
+                        "UPDATE chunks SET source_location_json = ?",
+                        (json.dumps(location),),
+                    )
+
+                imported = list_imported_work_items(
+                    owner_id=1,
+                    organization_id="org-a",
+                )
+
+        self.assertEqual(
+            imported.items[0].azure_url,
+            "https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/101",
+        )
+
+    def test_saved_connection_encrypts_pat_and_returns_non_secret_summary(self) -> None:
+        """Saving a validated connection must persist the PAT without exposing it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "azure-saved.db"
+            with patch.object(database, "DATABASE_PATH", database_path):
+                database.initialize_database()
+                with database.get_connection() as connection:
+                    connection.execute(
+                        "INSERT INTO organizations (id, name) VALUES ('org-a', 'Org A')"
+                    )
+                    connection.execute(
+                        """INSERT INTO users
+                           (id, email, password_hash, organization_id, role)
+                           VALUES (1, 'owner@example.com', 'hash', 'org-a',
+                                   'organization_admin')"""
+                    )
+
+                validation = AzureDevOpsValidationResult(
+                    organization_url="https://dev.azure.com/Laserbeamch",
+                    projects=[AzureDevOpsProject(id="project-1", name="Hunt")],
+                    checks=["organization_url", "pat_authentication"],
+                )
+                with patch.object(azure_devops, "validate_connection", return_value=validation):
+                    saved = save_validated_connection(
+                        owner_id=1,
+                        organization_id="org-a",
+                        organization_url="https://dev.azure.com/Laserbeamch",
+                        personal_access_token="secret-pat",
+                    )
+
+                with database.get_connection() as connection:
+                    row = connection.execute(
+                        """SELECT encrypted_pat FROM azure_devops_connections
+                           WHERE organization_id = 'org-a' AND user_id = 1"""
+                    ).fetchone()
+
+                self.assertTrue(saved.connected)
+                self.assertTrue(saved.token_saved)
+                self.assertEqual(saved.organization_url, "https://dev.azure.com/Laserbeamch")
+                self.assertEqual(saved.projects[0].name, "Hunt")
+                self.assertNotIn("secret-pat", row["encrypted_pat"])
+                self.assertNotIn("secret-pat", str(saved))
+                self.assertNotIn("secret-pat", str(get_saved_connection(owner_id=1, organization_id="org-a")))
 
 
 class AzureDevOpsRouteTests(unittest.TestCase):
@@ -303,6 +422,16 @@ class AzureDevOpsRouteTests(unittest.TestCase):
         self.db_patch = patch.object(database, "DATABASE_PATH", self.database_path)
         self.db_patch.start()
         database.initialize_database()
+        with database.get_connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO organizations (id, name) VALUES ('org-a', 'Org A')"
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO users
+                   (id, email, password_hash, organization_id, role)
+                   VALUES (1, 'owner@example.com', 'hash', 'org-a',
+                           'organization_admin')"""
+            )
         app.dependency_overrides[get_current_user] = lambda: {
             "id": 1,
             "email": "owner@example.com",
@@ -319,13 +448,13 @@ class AzureDevOpsRouteTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_test_endpoint_returns_projects_after_successful_validation(self) -> None:
-        """The UI receives connected=true only from a successful backend test."""
+        """A successful test saves the connection without echoing the PAT."""
         result = AzureDevOpsValidationResult(
             organization_url="https://dev.azure.com/Laserbeamch",
             projects=[AzureDevOpsProject(id="project-1", name="Knowledge Base")],
             checks=["organization_url", "pat_authentication", "work_items_read"],
         )
-        with patch("app.routes.azure_devops.validate_connection", return_value=result):
+        with patch("app.services.azure_devops.validate_connection", return_value=result):
             response = self.client.post(
                 "/integrations/azure-devops/test",
                 json={
@@ -335,8 +464,129 @@ class AzureDevOpsRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["connected"], True)
-        self.assertEqual(response.json()["projects"][0]["name"], "Knowledge Base")
+        body = response.json()
+        self.assertEqual(body["connected"], True)
+        self.assertEqual(body["projects"][0]["name"], "Knowledge Base")
+        self.assertEqual(body["token_saved"], True)
+        self.assertNotIn("pat-value", str(body))
+        with database.get_connection() as connection:
+            row = connection.execute(
+                "SELECT organization_url, encrypted_pat, connected FROM azure_devops_connections"
+            ).fetchone()
+        self.assertEqual(row["organization_url"], "https://dev.azure.com/Laserbeamch")
+        self.assertEqual(row["connected"], 1)
+        self.assertNotIn("pat-value", row["encrypted_pat"])
+
+    def test_connection_endpoint_returns_saved_state_without_pat(self) -> None:
+        """Reloading the configuration page returns saved status but not the token."""
+        validation = AzureDevOpsValidationResult(
+            organization_url="https://dev.azure.com/Laserbeamch",
+            projects=[AzureDevOpsProject(id="project-1", name="Knowledge Base")],
+            checks=["organization_url", "pat_authentication"],
+        )
+        with patch("app.services.azure_devops.validate_connection", return_value=validation):
+            save_validated_connection(
+                owner_id=1,
+                organization_id="org-a",
+                organization_url="https://dev.azure.com/Laserbeamch",
+                personal_access_token="secret-pat",
+            )
+            response = self.client.get("/integrations/azure-devops/connection")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["organization_url"], "https://dev.azure.com/Laserbeamch")
+        self.assertEqual(body["projects"][0]["id"], "project-1")
+        self.assertTrue(body["connected"])
+        self.assertTrue(body["token_saved"])
+        self.assertNotIn("secret-pat", str(body))
+
+    def test_connection_endpoint_marks_expired_saved_pat_disconnected(self) -> None:
+        """An invalid saved PAT is retained masked but no longer shown as connected."""
+        validation = AzureDevOpsValidationResult(
+            organization_url="https://dev.azure.com/Laserbeamch",
+            projects=[AzureDevOpsProject(id="project-1", name="Knowledge Base")],
+            checks=["organization_url", "pat_authentication"],
+        )
+        with patch("app.services.azure_devops.validate_connection", return_value=validation):
+            save_validated_connection(
+                owner_id=1,
+                organization_id="org-a",
+                organization_url="https://dev.azure.com/Laserbeamch",
+                personal_access_token="expired-pat",
+            )
+        error = AzureDevOpsConnectionError(
+            401,
+            "pat_authentication_failed",
+            "Azure DevOps rejected the PAT. Check that it is active, not expired, not revoked, and created for this organization.",
+        )
+        with patch("app.services.azure_devops.validate_connection", side_effect=error):
+            response = self.client.get("/integrations/azure-devops/connection")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["connected"])
+        self.assertTrue(body["token_saved"])
+        self.assertIn("rejected the PAT", body["message"])
+        self.assertNotIn("expired-pat", str(body))
+
+    def test_sync_endpoint_can_use_saved_pat_without_frontend_echo(self) -> None:
+        """Saved credentials allow sync without resending the PAT from the browser."""
+        validation = AzureDevOpsValidationResult(
+            organization_url="https://dev.azure.com/Laserbeamch",
+            projects=[AzureDevOpsProject(id="project-1", name="Knowledge Base")],
+            checks=["organization_url", "pat_authentication"],
+        )
+        with patch("app.services.azure_devops.validate_connection", return_value=validation):
+            save_validated_connection(
+                owner_id=1,
+                organization_id="org-a",
+                organization_url="https://dev.azure.com/Laserbeamch",
+                personal_access_token="saved-pat",
+            )
+        with patch("app.routes.azure_devops.sync_work_items") as sync:
+            sync.return_value.project_id = "project-1"
+            sync.return_value.project_name = "Knowledge Base"
+            sync.return_value.imported_count = 0
+            sync.return_value.skipped_count = 0
+            sync.return_value.items = []
+            response = self.client.post(
+                "/integrations/azure-devops/sync",
+                json={
+                    "organization_url": "https://dev.azure.com/Laserbeamch",
+                    "project_id": "project-1",
+                    "project_name": "Knowledge Base",
+                    "work_item_types": ["Bug"],
+                    "states": ["Active"],
+                    "title_field": "System.Title",
+                    "content_field": "System.Description",
+                    "metadata_fields": ["System.State"],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sync.call_args.kwargs["personal_access_token"], "")
+
+    def test_disconnect_endpoint_soft_deletes_saved_pat(self) -> None:
+        """Disconnecting removes the saved PAT from future configuration loads."""
+        validation = AzureDevOpsValidationResult(
+            organization_url="https://dev.azure.com/Laserbeamch",
+            projects=[AzureDevOpsProject(id="project-1", name="Knowledge Base")],
+            checks=["organization_url", "pat_authentication"],
+        )
+        with patch("app.services.azure_devops.validate_connection", return_value=validation):
+            save_validated_connection(
+                owner_id=1,
+                organization_id="org-a",
+                organization_url="https://dev.azure.com/Laserbeamch",
+                personal_access_token="secret-pat",
+            )
+
+        response = self.client.delete("/integrations/azure-devops/connection")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["disconnected"])
+        self.assertIsNone(get_saved_connection(owner_id=1, organization_id="org-a"))
 
     def test_test_endpoint_exposes_failure_category_without_pat(self) -> None:
         """Failure responses include a category but never echo the PAT."""
@@ -345,7 +595,7 @@ class AzureDevOpsRouteTests(unittest.TestCase):
             "pat_authentication_failed",
             "Azure DevOps rejected the PAT.",
         )
-        with patch("app.routes.azure_devops.validate_connection", side_effect=error):
+        with patch("app.services.azure_devops.validate_connection", side_effect=error):
             response = self.client.post(
                 "/integrations/azure-devops/test",
                 json={
@@ -371,10 +621,11 @@ class AzureDevOpsRouteTests(unittest.TestCase):
                     document_id=10,
                     work_item_id=101,
                     title="Login bug",
+                    description="Login fails on submit",
+                    azure_url="https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/101",
                     work_item_type="Bug",
                     state="Active",
                     imported_at="2026-08-25 10:50:00",
-                    metadata={"project_name": "Hunt", "work_item_id": 101},
                 )
             ],
         )
@@ -388,6 +639,12 @@ class AzureDevOpsRouteTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["total"], 1)
         self.assertEqual(body["items"][0]["work_item_id"], 101)
+        self.assertEqual(body["items"][0]["description"], "Login fails on submit")
+        self.assertEqual(
+            body["items"][0]["azure_url"],
+            "https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/101",
+        )
+        self.assertNotIn("metadata", body["items"][0])
         imported.assert_called_once_with(
             owner_id=1,
             organization_id="org-a",

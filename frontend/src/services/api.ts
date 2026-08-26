@@ -80,11 +80,24 @@ export interface AzureDevOpsTestResponse {
   organization_url: string
   projects: AzureDevOpsProject[]
   checks: string[]
+  token_saved: boolean
+  last_tested_at: string | null
+  message: string
+}
+
+export interface AzureDevOpsConnectionResponse {
+  connected: boolean
+  organization_url: string
+  projects: AzureDevOpsProject[]
+  checks: string[]
+  token_saved: boolean
+  last_tested_at: string | null
+  message: string
 }
 
 export interface AzureDevOpsSyncRequest {
   organization_url: string
-  personal_access_token: string
+  personal_access_token?: string
   project_id: string
   project_name: string
   work_item_types: string[]
@@ -110,10 +123,15 @@ export interface AzureDevOpsImportedItem {
   document_id: number
   work_item_id: number
   title: string
+  description: string
+  azure_url: string
   work_item_type: string
   state: string
   imported_at: string
-  metadata: Record<string, unknown>
+}
+
+export interface AzureDevOpsDisconnectResponse {
+  disconnected: boolean
 }
 
 export interface AzureDevOpsImportedItemsResponse {
@@ -560,6 +578,20 @@ export async function testAzureDevOpsConnection(organizationUrl: string, persona
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ organization_url: organizationUrl, personal_access_token: personalAccessToken }),
+  })
+}
+
+export async function getAzureDevOpsConnection() {
+  return requestJson<AzureDevOpsConnectionResponse>('/integrations/azure-devops/connection', {
+    method: 'GET',
+    headers: authHeaders(),
+  })
+}
+
+export async function disconnectAzureDevOpsConnection() {
+  return requestJson<AzureDevOpsDisconnectResponse>('/integrations/azure-devops/connection', {
+    method: 'DELETE',
+    headers: authHeaders(),
   })
 }
 
