@@ -1,5 +1,8 @@
 """RAG chat endpoint."""
 
+import logging
+from time import perf_counter
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -22,6 +25,7 @@ from app.services.rag_service import answer_question
 from app.utils.rate_limit import enforce_request_limit
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
@@ -105,6 +109,8 @@ def chat(
     current_user: dict[str, object] = Depends(get_current_user),
 ) -> dict[str, object]:
     """Answer a question from uploaded documents."""
+    request_started = perf_counter()
+    diagnostic = RagRequestDiagnostic()
     client_ip = api_request.client.host if api_request.client else "unknown"
 
     enforce_request_limit(
@@ -142,20 +148,22 @@ def chat(
             request.document_id,
             request.version_id,
             request.conversation_id,
+            diagnostic=diagnostic,
             project_id=project_id,
             folder_id=request.folder_id,
         )
         if request.conversation_id:
-            append_exchange(
-                owner_id=int(current_user["id"]),
-                conversation_id=request.conversation_id,
-                question=request.question.strip(),
-                answer=str(result.get("answer") or ""),
-                sources=[
-                    source for source in (result.get("sources") or [])
-                    if isinstance(source, dict)
-                ],
-            )
+            with diagnostic.time_stage("chat_history_save_ms"):
+                append_exchange(
+                    owner_id=int(current_user["id"]),
+                    conversation_id=request.conversation_id,
+                    question=request.question.strip(),
+                    answer=str(result.get("answer") or ""),
+                    sources=[
+                        source for source in (result.get("sources") or [])
+                        if isinstance(source, dict)
+                    ],
+                )
         return result
     except HTTPException:
         raise
@@ -166,6 +174,12 @@ def chat(
             status_code=502,
             detail="The AI answer service is unavailable.",
         ) from error
+    finally:
+        diagnostic.record_stage_duration(
+            "total_chat_request_ms",
+            (perf_counter() - request_started) * 1000,
+        )
+        logger.info("chat_latency_breakdown timings_ms=%s", diagnostic.timings_ms)
 
 
 @router.post("/diagnostics", tags=["development diagnostics"])

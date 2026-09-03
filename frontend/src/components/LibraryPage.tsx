@@ -1,4 +1,4 @@
-import { Archive, Check, ChevronDown, Edit2, FileText, FolderOpen, Menu, Plus, Search, Trash2, Upload, X } from 'lucide-react'
+import { Archive, Check, Edit2, FileText, FolderOpen, Menu, Plus, Search, Trash2, Upload, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
@@ -19,6 +19,13 @@ function relativeDate(value: string) {
   if (days === 1) return 'Yesterday'
   if (days < 7) return `${days} days ago`
   return date.toLocaleDateString()
+}
+
+function documentSourceLabel(document: PolicyDocument) {
+  if (!document.projectId || !document.projectName) return 'All Documents'
+  return document.folderId && document.folderName
+    ? `Project: ${document.projectName} / Folder: ${document.folderName}`
+    : `Project: ${document.projectName}`
 }
 
 export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
@@ -270,15 +277,6 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
             <h2 className="text-[13px] font-semibold text-slate-900">Documents</h2>
             <span className="inline-flex h-6 items-center rounded-full bg-slate-100 px-2 text-[10px] font-medium text-slate-600">{filtered.length}</span>
           </div>
-          {filtered.length > 0 && <div className="hidden items-center gap-3 sm:flex">
-            <div className="flex items-center gap-2 text-[11px] text-slate-600">
-              <span>Sort by: Modified (Newest)</span>
-              <ChevronDown size={14} />
-            </div>
-            <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1">
-              <button type="button" className="grid h-6 w-6 place-items-center rounded text-slate-600 hover:bg-slate-100" aria-label="List view">⊞</button>
-            </div>
-          </div>}
         </div>
 
         {selectedVisibleCount > 0 && <div className="mb-3 flex min-h-10 items-center gap-3 rounded-lg border border-blue-100 bg-blue-50/70 px-3 text-[12px] font-semibold text-slate-700">
@@ -298,7 +296,7 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
               <input type="checkbox" checked={isSelected} onChange={event => toggleDocumentSelection(document.id, event.currentTarget.checked)} onClick={event => event.stopPropagation()} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label={`Select document ${document.name}`} />
               <button type="button" onClick={() => setSelectedDocument(document)} className="flex min-w-0 items-center gap-2.5 text-left">
                 <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-blue-50 text-blue-600"><FileText size={15} /></span>
-                <span className="min-w-0"><span className="block truncate font-semibold text-slate-900 hover:text-blue-600">{document.name}</span><span className="block text-[10px] text-slate-400 sm:hidden">{relativeDate(document.updatedAt)} · {document.size}</span></span>
+                <span className="min-w-0"><span className="block truncate font-semibold text-slate-900 hover:text-blue-600">{document.name}</span><span className="mt-0.5 block truncate text-[10px] text-slate-500">{documentSourceLabel(document)}</span><span className="block text-[10px] text-slate-400 sm:hidden">{relativeDate(document.updatedAt)} · {document.size}</span></span>
               </button>
               <span className="hidden text-slate-600 sm:block">{relativeDate(document.updatedAt)}</span>
               <span className="hidden text-slate-600 sm:block">{document.size}</span>

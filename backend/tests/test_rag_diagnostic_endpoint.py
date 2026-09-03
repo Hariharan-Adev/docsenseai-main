@@ -160,6 +160,7 @@ class RagDiagnosticEndpointTests(unittest.TestCase):
             reason="semantic_evidence",
             document_id=1,
         )
+        diagnostic.record_stage_duration("source_selection_ms", 2.5)
         diagnostic.finalize({"grounded": True})
         return {"grounded": True, "sources": sources}
 
@@ -237,6 +238,7 @@ class RagDiagnosticEndpointTests(unittest.TestCase):
         self.assertEqual(payload["retrieved_chunks"]["chunk_ids"], [100])
         self.assertEqual(payload["retrieved_chunks"]["similarity_scores"], [0.9])
         self.assertEqual(payload["final_context_selection"]["chunk_ids"], [100])
+        self.assertEqual(payload["timings_ms"]["source_selection_ms"], 2.5)
         self.assertEqual(payload["retrieved_chunks"]["text_previews"], [])
         for forbidden in (
             "private document 2 content",
@@ -295,6 +297,31 @@ class RagDiagnosticEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(answer.call_args.kwargs["persist_context"])
+
+    def test_chat_route_logs_latency_breakdown_without_returning_it(self) -> None:
+        def answer_stub(*args, **kwargs):
+            diagnostic = kwargs["diagnostic"]
+            diagnostic.record_stage_duration("source_selection_ms", 1.25)
+            return {"answer": "Done", "grounded": True, "sources": []}
+
+        with patch("app.routes.chat.answer_question", side_effect=answer_stub), patch(
+            "app.routes.chat.append_exchange"
+        ), patch("app.routes.chat.logger") as logger:
+            response = self.client.post(
+                "/chat",
+                json={
+                    "question": "Which policy applies?",
+                    "conversation_id": "chat-latency",
+                },
+            )
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("timings_ms", payload)
+        logged_timings = logger.info.call_args.args[1]
+        self.assertIn("total_chat_request_ms", logged_timings)
+        self.assertIn("source_selection_ms", logged_timings)
+        self.assertIn("chat_history_save_ms", logged_timings)
 
     def test_soft_deleted_document_chunk_or_version_is_filtered(self) -> None:
         mutations = (

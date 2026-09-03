@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -106,6 +107,52 @@ class ProjectTableTests(unittest.TestCase):
             self.assertIn("project_id", columns)
             self.assertIn("folder_id", columns)
 
+    def test_project_name_migration_deduplicates_existing_active_names(self) -> None:
+        """Legacy duplicate active projects are preserved before adding uniqueness."""
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "legacy-projects.db"
+            connection = sqlite3.connect(database_path)
+            connection.row_factory = sqlite3.Row
+            connection.executescript(
+                """
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at TEXT
+                );
+                INSERT INTO projects (id, organization_id, user_id, name) VALUES
+                    ('project_1', 'org-a', 10, 'ASRC'),
+                    ('project_2', 'org-a', 10, ' asrc '),
+                    ('project_3', 'org-a', 10, 'ASRC'),
+                    ('project_4', 'org-b', 20, 'asrc');
+                """
+            )
+
+            database._dedupe_active_project_names_v15(connection)
+            connection.execute(
+                """CREATE UNIQUE INDEX ux_projects_active_name
+                   ON projects(organization_id, user_id, lower(name))
+                   WHERE deleted_at IS NULL"""
+            )
+            rows = connection.execute(
+                "SELECT id, name FROM projects ORDER BY id"
+            ).fetchall()
+            connection.close()
+
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("project_1", "ASRC"),
+                ("project_2", "asrc (duplicate 2)"),
+                ("project_3", "ASRC (duplicate 3)"),
+                ("project_4", "asrc"),
+            ],
+        )
+
     def test_project_crud_is_owner_scoped_and_soft_deletes(self) -> None:
         """Only the owning user can see a project, and delete marks it inactive."""
         created = self.client.post(
@@ -156,6 +203,49 @@ class ProjectTableTests(unittest.TestCase):
                 "SELECT deleted_at FROM projects WHERE id = ?", (project["id"],)
             ).fetchone()["deleted_at"]
         self.assertIsNotNone(deleted_at)
+
+    def test_duplicate_project_names_are_rejected_in_owner_scope(self) -> None:
+        """Project names are trimmed, case-insensitive, and unique per owner."""
+        created = self.client.post("/projects", json={"name": "  ASRC  "})
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["name"], "ASRC")
+
+        for duplicate_name in ("ASRC", "asrc", "  ASRC  "):
+            duplicate = self.client.post("/projects", json={"name": duplicate_name})
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(duplicate.json()["detail"], "Project name already exists.")
+
+        with database.get_connection() as connection:
+            count = connection.execute(
+                """SELECT COUNT(*) FROM projects
+                   WHERE organization_id = 'org-a' AND user_id = 10
+                     AND lower(name) = 'asrc' AND deleted_at IS NULL"""
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        self.current_user = {
+            "id": 20,
+            "email": "other@example.com",
+            "organization_id": "org-b",
+            "role": "organization_admin",
+        }
+        same_name_other_owner = self.client.post("/projects", json={"name": "asrc"})
+        self.assertEqual(same_name_other_owner.status_code, 201)
+
+    def test_project_rename_rejects_duplicate_name(self) -> None:
+        """Renaming cannot bypass the project-name uniqueness rule."""
+        first = self.client.post("/projects", json={"name": "ASRC"}).json()
+        second = self.client.post("/projects", json={"name": "Finance"}).json()
+
+        duplicate = self.client.patch(
+            f"/projects/{second['id']}",
+            json={"name": " asrc "},
+        )
+
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json()["detail"], "Project name already exists.")
+        self.assertEqual(self.client.get(f"/projects/{first['id']}").json()["name"], "ASRC")
+        self.assertEqual(self.client.get(f"/projects/{second['id']}").json()["name"], "Finance")
 
     def test_folder_crud_enforces_project_scope_and_soft_deletes(self) -> None:
         """Folders are unique within one project and invisible after soft delete."""
@@ -249,6 +339,60 @@ class ProjectTableTests(unittest.TestCase):
             ).status_code,
             404,
         )
+
+    def test_document_listing_includes_real_project_and_folder_names(self) -> None:
+        """Document rows expose source names without changing stored document scope."""
+        project = self.client.post("/projects", json={"name": "ASRC"}).json()
+        folder = self.client.post(
+            f"/projects/{project['id']}/folders",
+            json={"name": "Database"},
+        ).json()
+        with database.get_connection() as connection:
+            for index, (filename, project_id, folder_id) in enumerate((
+                ("all-docs.txt", None, None),
+                ("project-doc.txt", project["id"], None),
+                ("folder-doc.txt", project["id"], folder["id"]),
+            ), start=1):
+                content_id = connection.execute(
+                    """INSERT INTO document_contents
+                       (owner_id, organization_id, file_hash, normalized_content_hash,
+                        extracted_text, processing_status)
+                       VALUES (?, ?, ?, ?, ?, 'completed')""",
+                    (10, "org-a", f"hash-{index}", f"normalized-{index}", filename),
+                ).lastrowid
+                connection.execute(
+                    """INSERT INTO documents
+                       (owner_id, organization_id, original_filename, display_filename,
+                        stored_filename, file_hash, content_id, project_id, folder_id,
+                        visibility, processing_status, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'private', 'completed',
+                               CURRENT_TIMESTAMP)""",
+                    (
+                        10,
+                        "org-a",
+                        filename,
+                        filename,
+                        filename,
+                        f"hash-{index}",
+                        content_id,
+                        project_id,
+                        folder_id,
+                    ),
+                )
+
+        response = self.client.get("/documents")
+
+        self.assertEqual(response.status_code, 200)
+        documents = {
+            document["filename"]: document
+            for document in response.json()["documents"]
+        }
+        self.assertIsNone(documents["all-docs.txt"]["project_id"])
+        self.assertIsNone(documents["all-docs.txt"]["project_name"])
+        self.assertEqual(documents["project-doc.txt"]["project_name"], "ASRC")
+        self.assertIsNone(documents["project-doc.txt"]["folder_name"])
+        self.assertEqual(documents["folder-doc.txt"]["project_name"], "ASRC")
+        self.assertEqual(documents["folder-doc.txt"]["folder_name"], "Database")
 
 
 if __name__ == "__main__":

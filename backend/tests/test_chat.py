@@ -459,3 +459,218 @@ class RagRetrievalPolicyTests(unittest.TestCase):
         self.assertEqual(calls[0]["document_id"], 12)
         self.assertEqual(calls[0]["version_id"], 34)
         self.assertEqual(result["sources"][0]["filename"], "UARD-Hunt-BMT.docx")
+
+    def test_simple_fact_prompt_uses_query_focused_excerpt(self) -> None:
+        long_prefix = " ".join(f"intro{i}" for i in range(260))
+        long_suffix = " ".join(f"tail{i}" for i in range(260))
+        evidence = "Dashboard shows announcements, review progress, action items, and budget summary."
+        candidate = {
+            "chunk_id": 701,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": f"{long_prefix} {evidence} {long_suffix}",
+            "source_type": "word",
+            "source_location": {"section": "Dashboard"},
+            "score": 0.92,
+        }
+
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval", document_id=12, sources=[candidate]
+            ),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "The dashboard shows announcements and review progress.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ) as generate, patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("What does the dashboard show?", 7)
+
+        prompt = generate.call_args.args[0]
+        self.assertIn(evidence, prompt)
+        self.assertLess(len(prompt), len(candidate["content"]))
+        self.assertNotIn("intro0 intro1 intro2", prompt)
+        self.assertTrue(result["grounded"])
+        self.assertIn(evidence, result["sources"][0]["text"])
+        self.assertLess(len(result["sources"][0]["text"]), len(candidate["content"]))
+
+    def test_simple_fact_prompt_uses_compact_final_context_prefix(self) -> None:
+        top_source = {
+            "chunk_id": 704,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": "Dashboard shows announcements and review progress.",
+            "source_type": "word",
+            "source_location": {"section": "Dashboard"},
+            "score": 0.92,
+        }
+        neighbor_source = {
+            "chunk_id": 705,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": " ".join(
+                ["Neighbor chunk keeps dashboard evidence nearby for the factual answer."] * 12
+            ),
+            "source_type": "word",
+            "source_location": {"section": "Dashboard"},
+            "score": 0.85,
+        }
+        extra_source = {
+            "chunk_id": 706,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": "Extra background should not be needed for this narrow answer.",
+            "source_type": "word",
+            "source_location": {"section": "Appendix"},
+            "score": 0.75,
+        }
+
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval",
+                document_id=12,
+                sources=[top_source, neighbor_source, extra_source],
+            ),
+        ), patch(
+            "app.services.rag_service.select_final_context",
+            return_value=[top_source],
+        ), patch(
+            "app.services.rag_service.expand_final_context_neighbors",
+            return_value=[top_source, neighbor_source, extra_source],
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={"answer": "The dashboard shows announcements.", "prompt_tokens": 1, "completion_tokens": 1},
+        ) as generate, patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("What does the dashboard show?", 7)
+
+        prompt = generate.call_args.args[0]
+        self.assertIn(top_source["content"], prompt)
+        self.assertIn(neighbor_source["content"], prompt)
+        self.assertNotIn(extra_source["content"], prompt)
+        self.assertEqual(len(result["sources"]), 2)
+        self.assertEqual(result["sources"][0]["filename"], top_source["filename"])
+        self.assertEqual(result["sources"][0]["text"], top_source["content"])
+        self.assertEqual(result["sources"][1]["text"], neighbor_source["content"])
+
+    def test_complex_prompt_keeps_full_context(self) -> None:
+        candidate = {
+            "chunk_id": 702,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": " ".join(f"context{i}" for i in range(700)),
+            "source_type": "word",
+            "source_location": {"section": "Comparison"},
+            "score": 0.92,
+        }
+
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval", document_id=12, sources=[candidate]
+            ),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={"answer": "Grounded comparison.", "prompt_tokens": 1, "completion_tokens": 1},
+        ) as generate, patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("Compare context10 and context690", 7)
+
+        prompt = generate.call_args.args[0]
+        self.assertIn("context0 context1 context2", prompt)
+        self.assertIn("context697 context698 context699", prompt)
+        self.assertTrue(result["grounded"])
+
+    def test_excerpt_citations_must_match_context_sent_to_model(self) -> None:
+        long_prefix = " ".join(f"before{i}" for i in range(260))
+        hidden_suffix = " ".join(f"hidden{i}" for i in range(260))
+        evidence = "Dashboard shows announcements and action items."
+        candidate = {
+            "chunk_id": 703,
+            "content_id": 70,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "performance.docx",
+            "content": f"{long_prefix} {evidence} {hidden_suffix}",
+            "source_type": "word",
+            "source_location": {"section": "Dashboard"},
+            "score": 0.92,
+        }
+
+        def reject_original_citation(result, **kwargs):
+            final_context_sources = kwargs.get("final_context_sources") or []
+            if result.get("sources") and result["sources"][0].get("text") == candidate["content"]:
+                return {
+                    "answer": "Information not available in the uploaded files.",
+                    "question_type": "source_selection",
+                    "grounded": False,
+                    "sources": [],
+                    "unavailable_reason": "citation_not_in_final_context",
+                }
+            self.assertLess(len(final_context_sources[0]["content"]), len(candidate["content"]))
+            return result
+
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval", document_id=12, sources=[candidate]
+            ),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={"answer": "Grounded.", "prompt_tokens": 1, "completion_tokens": 1},
+        ), patch(
+            "app.services.rag_service.validate_grounded_result",
+            side_effect=reject_original_citation,
+        ), patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("What does the dashboard show?", 7)
+
+        self.assertTrue(result["grounded"])
+        self.assertLess(len(result["sources"][0]["text"]), len(candidate["content"]))

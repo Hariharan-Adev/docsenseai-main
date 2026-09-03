@@ -14,6 +14,10 @@ function projectUpdatedAt(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString()
 }
 
+function normalizedProjectName(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
 // The projects index keeps unsupported project-management actions local and explicit.
 export default function ProjectsPage() {
   const { projects, createProject, selectedProjectId, setSelectedProjectId, setSelectedFolderId, setSelectedCollectionId, setSelectedDocument, setSidebarOpen, showToast } = useApp()
@@ -22,6 +26,7 @@ export default function ProjectsPage() {
   const [filter, setFilter] = useState<ProjectFilter>('all')
   const [createOpen, setCreateOpen] = useState(false)
   const [projectName, setProjectName] = useState('')
+  const [projectNameError, setProjectNameError] = useState('')
   const [creating, setCreating] = useState(false)
   const [actionsProjectId, setActionsProjectId] = useState<string | null>(null)
   const [pinnedProjectIds, setPinnedProjectIds] = useState<Set<string>>(() => new Set())
@@ -66,14 +71,21 @@ export default function ProjectsPage() {
     event.preventDefault()
     const name = projectName.trim()
     if (!name || creating) return
+    if (projects.some(project => normalizedProjectName(project.name) === normalizedProjectName(name))) {
+      setProjectNameError('Project name already exists.')
+      return
+    }
     setCreating(true)
     try {
       const project = await createProject(name)
       setProjectName('')
+      setProjectNameError('')
       setCreateOpen(false)
       openProject(project.id)
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Unable to create project.')
+      const message = error instanceof Error ? error.message : 'Unable to create project.'
+      if (message === 'Project name already exists.') setProjectNameError(message)
+      else showToast(message)
     } finally {
       setCreating(false)
     }
@@ -169,10 +181,10 @@ export default function ProjectsPage() {
       </div> : <div className="py-10 text-center"><FolderKanban className="mx-auto text-slate-300" size={26} /><p className="mt-2 text-[12px] font-semibold text-slate-600">{filter === 'shared' ? 'No projects have been shared with you.' : search ? 'No matching projects.' : 'No projects yet.'}</p>{filter !== 'shared' && !search && <button type="button" onClick={() => setCreateOpen(true)} className="mt-3 text-[11px] font-semibold text-blue-600 hover:text-blue-700">Create your first project</button>}</div>}
     </div>
 
-    <Modal open={createOpen} onClose={() => { if (!creating) { setCreateOpen(false); setProjectName('') } }} title="Create project">
+    <Modal open={createOpen} onClose={() => { if (!creating) { setCreateOpen(false); setProjectName(''); setProjectNameError('') } }} title="Create project">
       <form onSubmit={submitCreateProject} className="flex w-full flex-col gap-5">
-        <div className="w-full space-y-2"><label htmlFor="project-name" className="block text-xs font-semibold text-slate-700">Project name</label><input id="project-name" autoFocus value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="Enter project name" className="field h-11 w-full" maxLength={100} /><p className="text-[11px] leading-5 text-slate-500">Projects keep related chats, documents, and files together in one place.</p></div>
-        <div className="flex w-full justify-end gap-2"><Button type="button" variant="secondary" size="sm" disabled={creating} onClick={() => { setCreateOpen(false); setProjectName('') }}>Cancel</Button><Button type="submit" size="sm" disabled={!projectName.trim() || creating}>{creating ? 'Creating...' : 'Create project'}</Button></div>
+        <div className="w-full space-y-2"><label htmlFor="project-name" className="block text-xs font-semibold text-slate-700">Project name</label><input id="project-name" autoFocus value={projectName} onChange={event => { setProjectName(event.target.value); setProjectNameError('') }} placeholder="Enter project name" className="field h-11 w-full" maxLength={100} aria-invalid={projectNameError ? 'true' : undefined} aria-describedby={projectNameError ? 'project-name-error' : 'project-name-help'} />{projectNameError ? <p id="project-name-error" className="text-[11px] leading-5 text-red-600">{projectNameError}</p> : <p id="project-name-help" className="text-[11px] leading-5 text-slate-500">Projects keep related chats, documents, and files together in one place.</p>}</div>
+        <div className="flex w-full justify-end gap-2"><Button type="button" variant="secondary" size="sm" disabled={creating} onClick={() => { setCreateOpen(false); setProjectName(''); setProjectNameError('') }}>Cancel</Button><Button type="submit" size="sm" disabled={!projectName.trim() || creating}>{creating ? 'Creating...' : 'Create project'}</Button></div>
       </form>
     </Modal>
 

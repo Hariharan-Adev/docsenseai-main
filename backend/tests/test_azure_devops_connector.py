@@ -199,6 +199,8 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                                    'organization_admin')"""
                     )
 
+                description = ["<p>Login fails on submit</p>"]
+
                 def handler(request: httpx.Request) -> httpx.Response:
                     """Return Azure-like WIQL and batch work-item responses."""
                     if request.url.path == "/Laserbeamch/Hunt/_apis/wit/wiql":
@@ -210,10 +212,14 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                         return httpx.Response(200, json={"workItems": [{"id": 101}]})
                     if request.url.path == "/Laserbeamch/Hunt/_apis/wit/workitemsbatch":
                         body = json.loads(request.content.decode("utf-8"))
-                        self.assertEqual(
-                            body["fields"],
-                            ["System.Description", "System.State", "System.Title", "System.WorkItemType"],
-                        )
+                        self.assertIn("Microsoft.VSTS.Common.AcceptanceCriteria", body["fields"])
+                        self.assertIn("System.AssignedTo", body["fields"])
+                        self.assertIn("System.ChangedDate", body["fields"])
+                        self.assertIn("System.CreatedDate", body["fields"])
+                        self.assertIn("System.Description", body["fields"])
+                        self.assertIn("System.State", body["fields"])
+                        self.assertIn("System.Title", body["fields"])
+                        self.assertIn("System.WorkItemType", body["fields"])
                         return httpx.Response(
                             200,
                             json={
@@ -221,9 +227,13 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                                     "id": 101,
                                     "fields": {
                                         "System.Title": "Login bug",
-                                        "System.Description": "<p>Login fails on submit</p>",
+                                        "System.Description": description[0],
                                         "System.State": "Active",
                                         "System.WorkItemType": "Bug",
+                                        "System.CreatedDate": "2026-08-25T10:00:00Z",
+                                        "System.ChangedDate": "2026-08-25T11:00:00Z",
+                                        "System.AssignedTo": {"displayName": "Aparna"},
+                                        "Microsoft.VSTS.Common.AcceptanceCriteria": "<div>Reject invalid sessions</div>",
                                     },
                                 }]
                             },
@@ -268,19 +278,91 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                 self.assertEqual(result.items[0].work_item_id, 101)
                 self.assertEqual(len(store.points), 1)
                 with database.get_connection() as connection:
+                    document = connection.execute(
+                        """SELECT d.display_filename, d.project_id, d.folder_id,
+                                  p.name AS project_name, f.name AS folder_name
+                           FROM documents d
+                           JOIN projects p ON p.id = d.project_id
+                           JOIN folders f ON f.id = d.folder_id"""
+                    ).fetchone()
                     chunk = connection.execute(
                         """SELECT text, source_type, source_location_json,
-                                  indexing_status
+                                  indexing_status, project_id, folder_id
                            FROM chunks"""
                     ).fetchone()
+                self.assertEqual(document["display_filename"], "#101 - Login bug")
+                self.assertEqual(document["project_name"], "Azure Dev")
+                self.assertEqual(document["folder_name"], "Hunt / Bugs")
+                self.assertEqual(chunk["project_id"], document["project_id"])
+                self.assertEqual(chunk["folder_id"], document["folder_id"])
                 self.assertEqual(chunk["source_type"], "azure_devops")
                 self.assertEqual(chunk["indexing_status"], "completed")
                 self.assertIn("Content: Login fails on submit", chunk["text"])
-                self.assertIn("System.State: Active", chunk["text"])
-                self.assertIn("System.WorkItemType: Bug", chunk["text"])
+                self.assertIn("Acceptance Criteria: Reject invalid sessions", chunk["text"])
+                self.assertIn("Assigned To: Aparna", chunk["text"])
+                self.assertIn("State: Active", chunk["text"])
+                self.assertIn("Work Item Type: Bug", chunk["text"])
                 location = json.loads(chunk["source_location_json"])
                 self.assertEqual(location["project_name"], "Hunt")
                 self.assertEqual(location["work_item_id"], 101)
+                self.assertEqual(location["work_item_type"], "Bug")
+                self.assertEqual(location["state"], "Active")
+                self.assertEqual(location["assigned_to"], "Aparna")
+                self.assertEqual(location["docsense_folder_path"], ["Azure Dev", "Hunt", "Bugs"])
+
+                with patch.object(azure_devops.httpx, "Client", side_effect=client_factory), \
+                    patch.object(azure_devops, "create_embeddings", return_value=[[1.0] + [0.0] * 383]), \
+                    patch.object(azure_devops, "get_vector_store", return_value=store):
+                    unchanged = sync_work_items(
+                        organization_url="https://dev.azure.com/Laserbeamch",
+                        personal_access_token="pat-value",
+                        project_id="project-1",
+                        project_name="Hunt",
+                        work_item_types=["Bug"],
+                        states=["Active"],
+                        title_field="System.Title",
+                        content_field="System.Description",
+                        metadata_fields=["System.State", "System.WorkItemType"],
+                        owner_id=1,
+                        organization_id="org-a",
+                    )
+
+                self.assertEqual(unchanged.imported_count, 0)
+                self.assertEqual(unchanged.skipped_count, 1)
+                with database.get_connection() as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM folders").fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
+
+                description[0] = "<p>Login fails with SSO</p>"
+                with patch.object(azure_devops.httpx, "Client", side_effect=client_factory), \
+                    patch.object(azure_devops, "create_embeddings", return_value=[[0.5] + [0.0] * 383]), \
+                    patch.object(azure_devops, "get_vector_store", return_value=store):
+                    updated = sync_work_items(
+                        organization_url="https://dev.azure.com/Laserbeamch",
+                        personal_access_token="pat-value",
+                        project_id="project-1",
+                        project_name="Hunt",
+                        work_item_types=["Bug"],
+                        states=["Active"],
+                        title_field="System.Title",
+                        content_field="System.Description",
+                        metadata_fields=["System.State", "System.WorkItemType"],
+                        owner_id=1,
+                        organization_id="org-a",
+                    )
+
+                self.assertEqual(updated.imported_count, 1)
+                with database.get_connection() as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM folders").fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
+                    current_chunk = connection.execute(
+                        """SELECT c.text
+                           FROM chunks c
+                           JOIN documents d ON d.current_version_id = c.version_id
+                           WHERE d.original_filename = 'azure-devops-project-1-101.md'"""
+                    ).fetchone()
+                self.assertIn("Login fails with SSO", current_chunk["text"])
 
                 imported = list_imported_work_items(
                     owner_id=1,
@@ -291,7 +373,7 @@ class AzureDevOpsServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(imported.total, 1)
                 self.assertEqual(imported.items[0].title, "Login bug")
-                self.assertEqual(imported.items[0].description, "Login fails on submit")
+                self.assertEqual(imported.items[0].description, "Login fails with SSO")
                 self.assertEqual(
                     imported.items[0].azure_url,
                     "https://dev.azure.com/Laserbeamch/Hunt/_workitems/edit/101",

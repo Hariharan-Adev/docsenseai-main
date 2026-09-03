@@ -7,6 +7,7 @@ from html import unescape
 import json
 import re
 import sqlite3
+from uuid import uuid4
 from urllib.parse import urlparse
 from urllib.parse import quote
 
@@ -30,7 +31,24 @@ AZURE_DEVOPS_FIELD_OPTIONS = {
     "System.WorkItemType",
     "System.Tags",
     "System.AreaPath",
+    "System.CreatedDate",
+    "System.ChangedDate",
+    "System.AssignedTo",
+    "Microsoft.VSTS.Common.AcceptanceCriteria",
+    "Custom.SecurityCompliance",
 }
+AZURE_DEV_PROJECT_NAME = "Azure Dev"
+AUTOMATIC_WORK_ITEM_FIELDS = {
+    "System.Title",
+    "System.Description",
+    "System.State",
+    "System.WorkItemType",
+    "System.CreatedDate",
+    "System.ChangedDate",
+    "System.AssignedTo",
+    "Microsoft.VSTS.Common.AcceptanceCriteria",
+}
+OPTIONAL_WORK_ITEM_FIELDS = {"Custom.SecurityCompliance"}
 
 
 class AzureDevOpsConnectionError(Exception):
@@ -276,11 +294,105 @@ def _clean_field_text(value: object) -> str:
     """Convert Azure rich-text or scalar field values into compact plain text."""
     if value is None:
         return ""
+    if isinstance(value, dict):
+        display_name = value.get("displayName") or value.get("uniqueName") or value.get("id")
+        return _clean_field_text(display_name)
     text = str(value)
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
     text = re.sub(r"(?i)</p\s*>", "\n", text)
     text = re.sub(r"<[^>]+>", " ", text)
     return " ".join(unescape(text).split())
+
+
+def _azure_folder_name(azure_project_name: str, work_item_type: str) -> str:
+    """Fit the generated Azure project/type label into the existing folder limit."""
+    type_label = _plural_work_item_type(work_item_type)
+    suffix = f" / {type_label}"
+    project_label = " ".join(azure_project_name.split()) or "Azure Project"
+    return f"{project_label[:100 - len(suffix)]}{suffix}"
+
+
+def _plural_work_item_type(work_item_type: str) -> str:
+    """Use readable folder labels while supporting Azure's singular type names."""
+    normalized = " ".join(work_item_type.split()) or "Work Items"
+    known = {
+        "bug": "Bugs",
+        "task": "Tasks",
+        "user story": "User Stories",
+    }
+    return known.get(normalized.casefold(), normalized if normalized.endswith("s") else f"{normalized}s")
+
+
+def _ensure_azure_document_scope(
+    connection: sqlite3.Connection,
+    *,
+    organization_id: str,
+    owner_id: int,
+    azure_project_name: str,
+    work_item_type: str,
+) -> tuple[str, str]:
+    """Create or reuse the automatic Azure Dev project and project/type folder."""
+    project = connection.execute(
+        """SELECT id FROM projects
+           WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+             AND lower(name) = lower(?)""",
+        (organization_id, owner_id, AZURE_DEV_PROJECT_NAME),
+    ).fetchone()
+    if project is None:
+        docsense_project_id = f"project_{uuid4().hex}"
+        try:
+            connection.execute(
+                """INSERT INTO projects (id, organization_id, user_id, name, description)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    docsense_project_id,
+                    organization_id,
+                    owner_id,
+                    AZURE_DEV_PROJECT_NAME,
+                    "Automatically organized Azure DevOps work items.",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            project = connection.execute(
+                """SELECT id FROM projects
+                   WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+                     AND lower(name) = lower(?)""",
+                (organization_id, owner_id, AZURE_DEV_PROJECT_NAME),
+            ).fetchone()
+            if project is None:
+                raise
+            docsense_project_id = str(project["id"])
+    else:
+        docsense_project_id = str(project["id"])
+
+    folder_name = _azure_folder_name(azure_project_name, work_item_type)
+    folder = connection.execute(
+        """SELECT id FROM folders
+           WHERE organization_id = ? AND user_id = ? AND project_id = ?
+             AND deleted_at IS NULL AND lower(name) = lower(?)""",
+        (organization_id, owner_id, docsense_project_id, folder_name),
+    ).fetchone()
+    if folder is not None:
+        return docsense_project_id, str(folder["id"])
+
+    folder_id = f"folder_{uuid4().hex}"
+    try:
+        connection.execute(
+            """INSERT INTO folders (id, organization_id, user_id, project_id, name)
+               VALUES (?, ?, ?, ?, ?)""",
+            (folder_id, organization_id, owner_id, docsense_project_id, folder_name),
+        )
+    except sqlite3.IntegrityError:
+        folder = connection.execute(
+            """SELECT id FROM folders
+               WHERE organization_id = ? AND user_id = ? AND project_id = ?
+                 AND deleted_at IS NULL AND lower(name) = lower(?)""",
+            (organization_id, owner_id, docsense_project_id, folder_name),
+        ).fetchone()
+        if folder is None:
+            raise
+        folder_id = str(folder["id"])
+    return docsense_project_id, folder_id
 
 
 def _line_value(text: str, label: str) -> str:
@@ -342,6 +454,7 @@ def _fetch_work_items(
     project_name: str,
     headers: dict[str, str],
     fields: list[str],
+    optional_fields: set[str] | None = None,
     work_item_types: list[str],
     states: list[str],
 ) -> list[dict[str, object]]:
@@ -380,6 +493,14 @@ def _fetch_work_items(
         headers=headers,
         json={"ids": ids, "fields": fields, "errorPolicy": "Omit"},
     )
+    if batch_response.status_code == 400 and optional_fields:
+        required_fields = [field for field in fields if field not in optional_fields]
+        batch_response = client.post(
+            f"{organization_url}/{project_segment}/_apis/wit/workitemsbatch",
+            params={"api-version": WORK_ITEMS_API_VERSION},
+            headers=headers,
+            json={"ids": ids, "fields": required_fields, "errorPolicy": "Omit"},
+        )
     _raise_for_status(batch_response, "work_items_batch")
     return [
         item for item in batch_response.json().get("value", [])
@@ -409,18 +530,32 @@ def _index_work_item(
     except (TypeError, ValueError):
         return None
     title = _clean_field_text(fields.get(title_field)) or f"Azure Work Item {work_item_id}"
-    display_filename = f"{title} (Azure #{work_item_id})"
+    display_filename = f"#{work_item_id} - {title}"
     content = _clean_field_text(fields.get(content_field))
+    work_item_type = _clean_field_text(fields.get("System.WorkItemType")) or "Work Item"
+    state = _clean_field_text(fields.get("System.State"))
+    created_date = _clean_field_text(fields.get("System.CreatedDate"))
+    updated_date = _clean_field_text(fields.get("System.ChangedDate"))
+    assigned_to = _clean_field_text(fields.get("System.AssignedTo"))
+    acceptance_criteria = _clean_field_text(fields.get("Microsoft.VSTS.Common.AcceptanceCriteria"))
+    security_compliance = _clean_field_text(fields.get("Custom.SecurityCompliance"))
     metadata_lines = [
         f"{field}: {_clean_field_text(fields.get(field))}"
         for field in metadata_fields
-        if _clean_field_text(fields.get(field))
+        if field not in AUTOMATIC_WORK_ITEM_FIELDS and _clean_field_text(fields.get(field))
     ]
     text = "\n".join([
         f"Title: {title}",
         f"Azure Work Item ID: {work_item_id}",
         f"Project: {project_name}",
+        f"Work Item Type: {work_item_type}",
+        f"State: {state}" if state else "",
+        f"Created Date: {created_date}" if created_date else "",
+        f"Updated Date: {updated_date}" if updated_date else "",
+        f"Assigned To: {assigned_to}" if assigned_to else "",
         f"Content: {content}" if content else "",
+        f"Acceptance Criteria: {acceptance_criteria}" if acceptance_criteria else "",
+        f"Security Compliance: {security_compliance}" if security_compliance else "",
         *metadata_lines,
     ]).strip()
     normalized_text = normalize_extracted_text(text)
@@ -436,8 +571,14 @@ def _index_work_item(
         "source_type": "azure_devops",
         "organization_url": organization_url,
         "project_id": project_id,
+        "azure_project_id": project_id,
         "project_name": project_name,
         "work_item_id": work_item_id,
+        "work_item_type": work_item_type,
+        "state": state,
+        "created_date": created_date,
+        "updated_date": updated_date,
+        "assigned_to": assigned_to,
         "title_field": title_field,
         "content_field": content_field,
         "metadata_fields": metadata_fields,
@@ -453,8 +594,23 @@ def _index_work_item(
 
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        docsense_project_id, folder_id = _ensure_azure_document_scope(
+            connection,
+            organization_id=organization_id,
+            owner_id=owner_id,
+            azure_project_name=project_name,
+            work_item_type=work_item_type,
+        )
+        source_metadata["docsense_project_id"] = docsense_project_id
+        source_metadata["docsense_folder_id"] = folder_id
+        source_metadata["docsense_folder_path"] = [
+            AZURE_DEV_PROJECT_NAME,
+            project_name,
+            _plural_work_item_type(work_item_type),
+        ]
         existing_document = connection.execute(
-            """SELECT id, current_version_id FROM documents
+            """SELECT id, current_version_id, project_id, folder_id
+               FROM documents
                WHERE organization_id = ? AND owner_id = ? AND original_filename = ?
                  AND deleted_at IS NULL
                ORDER BY id DESC LIMIT 1""",
@@ -473,7 +629,11 @@ def _index_work_item(
                 (existing_document["current_version_id"],),
             ).fetchone()
             if current_version and int(current_version["content_id"]) == int(existing_content["id"]):
-                return None
+                if (
+                    existing_document["project_id"] == docsense_project_id
+                    and existing_document["folder_id"] == folder_id
+                ):
+                    return None
 
         if existing_content:
             content_id = int(existing_content["id"])
@@ -499,12 +659,13 @@ def _index_work_item(
                 """INSERT INTO documents
                    (owner_id, organization_id, original_filename, display_filename,
                     stored_filename, file_hash, content_id, visibility,
-                    processing_status, updated_at)
+                    processing_status, updated_at, project_id, folder_id)
                    VALUES (?, ?, ?, ?, '', ?, ?, 'private', 'completed',
-                           CURRENT_TIMESTAMP)""",
+                           CURRENT_TIMESTAMP, ?, ?)""",
                 (
                     owner_id, organization_id, original_filename,
                     display_filename, file_hash, content_id,
+                    docsense_project_id, folder_id,
                 ),
             ).lastrowid)
             version_number = 1
@@ -530,23 +691,26 @@ def _index_work_item(
                (content_id, chunk_index, text, embedding, organization_id,
                 document_id, version_id, source_type, source_location_json,
                 token_count, vector_point_id, embedding_model,
-                embedding_dimension, indexing_status, qdrant_indexed_at)
+                embedding_dimension, project_id, folder_id, indexing_status,
+                qdrant_indexed_at)
                VALUES (?, 0, ?, ?, ?, ?, ?, 'azure_devops', ?, ?, ?, ?, ?,
-                       'pending', NULL)""",
+                       ?, ?, 'pending', NULL)""",
             (
                 content_id, normalized_text, json.dumps(embedding), organization_id,
                 document_id, version_id, json.dumps(source_metadata),
                 len(normalized_text.split()), point_id,
                 settings.embedding_model_version, settings.embedding_dimension,
+                docsense_project_id, folder_id,
             ),
         ).lastrowid)
         connection.execute(
             """UPDATE documents SET current_version_id = ?, content_id = ?,
-               file_hash = ?, display_filename = ?, updated_at = CURRENT_TIMESTAMP
+               file_hash = ?, display_filename = ?, project_id = ?,
+               folder_id = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND organization_id = ?""",
             (
                 version_id, content_id, file_hash, display_filename,
-                document_id, organization_id,
+                docsense_project_id, folder_id, document_id, organization_id,
             ),
         )
 
@@ -564,6 +728,7 @@ def _index_work_item(
         visibility="private",
         source_type="azure_devops",
         source_location=source_metadata,
+        project_id=docsense_project_id,
         embedding_model=settings.embedding_model_version,
     )
     get_vector_store().upsert_chunks([point])
@@ -794,7 +959,7 @@ def sync_work_items(
     title_field = _validate_field_name(title_field)
     content_field = _validate_field_name(content_field)
     metadata_fields = [_validate_field_name(field) for field in metadata_fields]
-    fields = sorted({title_field, content_field, *metadata_fields})
+    fields = sorted({title_field, content_field, *metadata_fields, *AUTOMATIC_WORK_ITEM_FIELDS, *OPTIONAL_WORK_ITEM_FIELDS})
     safe_types = [value.strip() for value in work_item_types if value.strip()]
     safe_states = [value.strip() for value in states if value.strip()]
     if not project_id.strip() or not project_name.strip():
@@ -817,6 +982,7 @@ def sync_work_items(
                 project_name=project_name.strip(),
                 headers=headers,
                 fields=fields,
+                optional_fields=OPTIONAL_WORK_ITEM_FIELDS,
                 work_item_types=safe_types,
                 states=safe_states,
             )
@@ -924,8 +1090,8 @@ def list_imported_work_items(
         except (TypeError, ValueError):
             continue
         title = _line_value(text, "Title") or str(row["display_filename"] or "")
-        imported_type = _line_value(text, "System.WorkItemType")
-        imported_state = _line_value(text, "System.State")
+        imported_type = _line_value(text, "Work Item Type") or _line_value(text, "System.WorkItemType")
+        imported_state = _line_value(text, "State") or _line_value(text, "System.State")
         imported_at = str(row["completed_at"] or row["updated_at"] or "")
         item = AzureDevOpsImportedItem(
             document_id=int(row["document_id"]),

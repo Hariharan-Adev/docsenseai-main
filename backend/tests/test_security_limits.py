@@ -17,6 +17,7 @@ from app.services.document_loader import DocumentParseError
 from app.services import ingestion_jobs
 from app.services.ingestion_jobs import _extract_bundle
 from app.services.storage import resolve_storage_key, storage_key_for
+from db import database
 from app.utils.file_validation import validate_file_signature
 
 
@@ -46,12 +47,39 @@ class SecurityLimitTests(unittest.TestCase):
         self.assertIn("compression ratio", raised.exception.detail)
 
     def test_storage_keys_are_tenant_partitioned_and_traversal_safe(self) -> None:
+        org_a_key = storage_key_for("org-a", "file.txt")
+        org_b_key = storage_key_for("org-b", "file.txt")
         self.assertNotEqual(
-            storage_key_for("org-a", "file.txt").split("/", 1)[0],
-            storage_key_for("org-b", "file.txt").split("/", 1)[0],
+            org_a_key.split("/", 1)[0],
+            org_b_key.split("/", 1)[0],
         )
-        with self.assertRaises(ValueError):
-            resolve_storage_key("../outside.txt")
+        self.assertNotIn("org-a", org_a_key)
+        self.assertRegex(org_a_key.split("/", 1)[0], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            resolve_storage_key("legacy.txt"),
+            database.UPLOAD_DIRECTORY.resolve() / "legacy.txt",
+        )
+        self.assertEqual(
+            resolve_storage_key(org_a_key),
+            database.UPLOAD_DIRECTORY.resolve() / org_a_key,
+        )
+
+        invalid_keys = [
+            "../outside.txt",
+            "..\\outside.txt",
+            "/tmp/outside.txt",
+            "C:/temp/outside.txt",
+            "C:\\temp\\outside.txt",
+            "\\\\server\\share\\outside.txt",
+            "%2e%2e/outside.txt",
+            "..%2foutside.txt",
+            "tenant/%2e%2e/outside.txt",
+            "tenant\\..\\outside.txt",
+        ]
+        for storage_key in invalid_keys:
+            with self.subTest(storage_key=storage_key):
+                with self.assertRaises(ValueError):
+                    resolve_storage_key(storage_key)
 
     def test_production_parser_timeout_terminates_isolated_process(self) -> None:
         class TimeoutQueue:

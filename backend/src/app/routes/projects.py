@@ -1,5 +1,6 @@
 """Owner-scoped project CRUD without cascading document or vector deletion."""
 
+import sqlite3
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -64,6 +65,25 @@ def _normalized_name(value: str, label: str) -> str:
     return name
 
 
+def _project_name_exists(name: str, user: dict[str, object], excluded_project_id: str | None = None) -> bool:
+    """Check active project-name uniqueness inside the authenticated owner scope."""
+    with get_connection() as connection:
+        return connection.execute(
+            """SELECT 1 FROM projects
+               WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
+                 AND lower(name) = lower(?)
+                 AND (? IS NULL OR id != ?)
+               LIMIT 1""",
+            (
+                user["organization_id"],
+                user["id"],
+                name,
+                excluded_project_id,
+                excluded_project_id,
+            ),
+        ).fetchone() is not None
+
+
 def _folder_row(folder_id: str, user: dict[str, object]):
     """Load one active folder only inside the authenticated owner and tenant scope."""
     with get_connection() as connection:
@@ -123,13 +143,20 @@ def _insert_folder(project_id: str, name: str, user: dict[str, object]) -> str:
 def create_project(payload: ProjectCreate, current_user=Depends(get_current_user)):
     """Create an owner-scoped project and return its persisted representation."""
     name = _normalized_name(payload.name, "Project name")
+    if _project_name_exists(name, current_user):
+        raise HTTPException(status_code=409, detail="Project name already exists.")
     project_id = f"project_{uuid4().hex}"
-    with get_connection() as connection:
-        connection.execute(
-            """INSERT INTO projects (id, organization_id, user_id, name, description)
-               VALUES (?, ?, ?, ?, ?)""",
-            (project_id, current_user["organization_id"], current_user["id"], name, payload.description),
-        )
+    try:
+        with get_connection() as connection:
+            connection.execute(
+                """INSERT INTO projects (id, organization_id, user_id, name, description)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (project_id, current_user["organization_id"], current_user["id"], name, payload.description),
+            )
+    except sqlite3.IntegrityError as error:
+        if "ux_projects_active_name" in str(error):
+            raise HTTPException(status_code=409, detail="Project name already exists.") from error
+        raise
     return dict(require_project(project_id, current_user))
 
 
@@ -157,17 +184,24 @@ def update_project(project_id: str, payload: ProjectUpdate, current_user=Depends
     """Update project metadata while retaining ownership and stable identity."""
     require_project(project_id, current_user)
     name = _normalized_name(payload.name, "Project name") if payload.name is not None else None
+    if name is not None and _project_name_exists(name, current_user, project_id):
+        raise HTTPException(status_code=409, detail="Project name already exists.")
     # Explicit null clears the optional description; omitted fields preserve it.
     description_provided = "description" in payload.model_fields_set
-    with get_connection() as connection:
-        connection.execute(
-            """UPDATE projects SET name = COALESCE(?, name),
-                   description = CASE WHEN ? THEN ? ELSE description END,
-                   updated_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND organization_id = ? AND user_id = ? AND deleted_at IS NULL""",
-            (name, description_provided, payload.description, project_id,
-             current_user["organization_id"], current_user["id"]),
-        )
+    try:
+        with get_connection() as connection:
+            connection.execute(
+                """UPDATE projects SET name = COALESCE(?, name),
+                       description = CASE WHEN ? THEN ? ELSE description END,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND organization_id = ? AND user_id = ? AND deleted_at IS NULL""",
+                (name, description_provided, payload.description, project_id,
+                 current_user["organization_id"], current_user["id"]),
+            )
+    except sqlite3.IntegrityError as error:
+        if "ux_projects_active_name" in str(error):
+            raise HTTPException(status_code=409, detail="Project name already exists.") from error
+        raise
     return dict(require_project(project_id, current_user))
 
 

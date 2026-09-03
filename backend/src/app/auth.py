@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+import jwt
 from pwdlib import PasswordHash
 
 from app.config import settings
@@ -56,7 +56,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict[str, object]:
         )
         user_id = int(payload.get("sub", ""))
         token_organization_id = str(payload.get("org", ""))
-    except (JWTError, ValueError, TypeError):
+    except (jwt.PyJWTError, ValueError, TypeError):
         raise CREDENTIALS_ERROR
 
     with get_connection() as connection:

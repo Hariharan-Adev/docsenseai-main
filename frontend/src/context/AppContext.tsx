@@ -166,6 +166,7 @@ function mapDocument(row: DocumentRecord): PolicyDocument {
     collectionId: row.collection_id,
     collectionName: row.collection_name,
     projectId: row.project_id,
+    projectName: row.project_name,
     folderId: row.folder_id,
     folderName: row.folder_name,
     relativePath: row.relative_path,

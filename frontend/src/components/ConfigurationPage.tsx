@@ -56,7 +56,7 @@ type ConfigurationPageProps = {
 
 // Renders integration configuration while keeping its selection synchronized with the URL.
 export default function ConfigurationPage({ onBack, onNavigate, routeIntegrationId }: ConfigurationPageProps) {
-  const { showToast } = useApp()
+  const { refreshDocuments, showToast } = useApp()
   const [selectedIntegration, setSelectedIntegration] = useState<'azure-dev' | 'catalog' | 'github' | null>(null)
   const [integrationSearch, setIntegrationSearch] = useState('')
   const [organizationUrl, setOrganizationUrl] = useState('')
@@ -65,7 +65,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
   const [savedAzureToken, setSavedAzureToken] = useState(false)
   const [updatingAzureToken, setUpdatingAzureToken] = useState(false)
   const [selectedProject, setSelectedProject] = useState('')
-  const [workItemTypes, setWorkItemTypes] = useState(['Bug', 'User Story'])
+  const [workItemTypes, setWorkItemTypes] = useState(['Bug', 'User Story', 'Task'])
   const [states, setStates] = useState(['New', 'Active'])
   const [titleField, setTitleField] = useState('System.Title')
   const [contentField, setContentField] = useState('System.Description')
@@ -193,7 +193,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setAzureDevConnected(false)
     setAzureDevProjects([])
     setAzureDevConnectionMessage('Use Test Connection to verify the current credentials.')
-    setWorkItemTypes(['Bug', 'User Story'])
+    setWorkItemTypes(['Bug', 'User Story', 'Task'])
     setStates(['New', 'Active'])
     setTitleField('System.Title')
     setContentField('System.Description')
@@ -203,7 +203,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
     setSyncChangedOnly(true)
   }
 
-  const fieldOptions = ['System.Title', 'System.Description', 'System.State', 'System.WorkItemType', 'System.Tags', 'System.AreaPath']
+  const fieldOptions = ['System.Title', 'System.Description', 'Microsoft.VSTS.Common.AcceptanceCriteria', 'Custom.SecurityCompliance', 'System.State', 'System.WorkItemType', 'System.CreatedDate', 'System.ChangedDate', 'System.AssignedTo', 'System.Tags', 'System.AreaPath']
   const importedTypeOptions = ['', 'Bug', 'User Story', 'Task', 'Epic']
   const importedStateOptions = ['', 'New', 'Active', 'Resolved', 'Closed']
   const organizationSummary = organizationUrl.trim() || 'Not set'
@@ -321,6 +321,7 @@ export default function ConfigurationPage({ onBack, onNavigate, routeIntegration
       const message = `Imported ${result.imported_count} Azure work item${result.imported_count === 1 ? '' : 's'}${result.skipped_count ? `, skipped ${result.skipped_count} unchanged` : ''}.`
       setAzureDevConnectionMessage(message)
       showToast(message)
+      void refreshDocuments()
       void refreshImportedAzureItemCount()
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Azure DevOps sync failed.'

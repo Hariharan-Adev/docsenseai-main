@@ -58,6 +58,7 @@ export interface DocumentRecord {
   current_version_id?: number | null
   current_version_number?: number | null
   project_id?: string | null
+  project_name?: string | null
   folder_id?: string | null
   folder_name?: string | null
 }
@@ -713,6 +714,22 @@ export async function deleteDocument(documentId: string) {
     method: 'DELETE',
     headers: authHeaders(),
   })
+}
+
+export async function fetchDocumentFile(documentId: string, download = false) {
+  // File previews use bearer-authenticated fetches because object URLs cannot send headers.
+  const query = download ? '?download=true' : ''
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/file${query}`, {
+    method: 'GET',
+    headers: authHeaders(),
+  })
+
+  if (!response.ok) {
+    const error = await readError(response, 'Unable to load document file.')
+    throw new ApiError(error.message, response.status, error.code, error.retryable)
+  }
+
+  return response.blob()
 }
 
 export async function sendChatMessage(question: string, collectionId?: number | null, documentId?: number | null, conversationId?: string | null, projectId?: string | null, folderId?: string | null) {

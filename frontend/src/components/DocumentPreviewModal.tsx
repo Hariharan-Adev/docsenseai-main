@@ -1,9 +1,16 @@
-import { CheckCircle2, Clock3, FileText, Highlighter, RotateCcw, XCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Clock3, Download, FileText, Highlighter, RotateCcw, XCircle } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useApp } from '../context/AppContext'
-import { listDocumentVersions, makeDocumentVersionCurrent, uploadDocumentVersion, type DocumentVersion } from '../services/api'
+import { fetchDocumentFile, listDocumentVersions, makeDocumentVersionCurrent, uploadDocumentVersion, type DocumentVersion } from '../services/api'
 import { Button } from './ui/Button'
 import { Modal } from './ui/Modal'
+
+const BROWSER_PREVIEW_TYPES = new Set(['PDF', 'PNG', 'JPG', 'JPEG', 'BMP', 'GIF', 'WEBP', 'TXT', 'CSV'])
+
+// Limit embedded previews to formats browsers can render from a blob URL.
+function canBrowserPreview(type: string) {
+  return BROWSER_PREVIEW_TYPES.has(type)
+}
 
 export default function DocumentPreviewModal() {
   const { selectedDocument, setSelectedDocument, retrievedDocuments, refreshDocuments, showToast } = useApp()
@@ -11,6 +18,9 @@ export default function DocumentPreviewModal() {
   const [loadingVersions, setLoadingVersions] = useState(false)
   const [versionError, setVersionError] = useState('')
   const [uploadingVersion, setUploadingVersion] = useState(false)
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [loadingPreview, setLoadingPreview] = useState(false)
+  const [previewError, setPreviewError] = useState('')
 
   useEffect(() => {
     if (!selectedDocument?.uploaded) return
@@ -24,8 +34,35 @@ export default function DocumentPreviewModal() {
     return () => { active = false }
   }, [selectedDocument?.id, selectedDocument?.uploaded])
 
+  useEffect(() => {
+    if (!selectedDocument?.uploaded || !canBrowserPreview(selectedDocument.type)) {
+      setPreviewUrl('')
+      setPreviewError('')
+      setLoadingPreview(false)
+      return
+    }
+    let active = true
+    let objectUrl = ''
+    setPreviewUrl('')
+    setLoadingPreview(true)
+    setPreviewError('')
+    void fetchDocumentFile(selectedDocument.id)
+      .then(blob => {
+        objectUrl = URL.createObjectURL(blob)
+        if (active) setPreviewUrl(objectUrl)
+        else URL.revokeObjectURL(objectUrl)
+      })
+      .catch(error => { if (active) setPreviewError(error instanceof Error ? error.message : 'Unable to load document preview.') })
+      .finally(() => { if (active) setLoadingPreview(false) })
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [selectedDocument?.id, selectedDocument?.type, selectedDocument?.uploaded])
+
   if (!selectedDocument) return null
   const reference = retrievedDocuments.find(source => source.id === selectedDocument.id || source.name === selectedDocument.name)
+  const previewable = selectedDocument.uploaded && canBrowserPreview(selectedDocument.type)
 
   const makeCurrent = async (version: DocumentVersion) => {
     await makeDocumentVersionCurrent(selectedDocument.id, version.id)
@@ -50,6 +87,23 @@ export default function DocumentPreviewModal() {
     }
   }
 
+  // Fetch through the authenticated file endpoint so private documents never need a public URL.
+  const downloadSelectedDocument = async () => {
+    try {
+      const blob = await fetchDocumentFile(selectedDocument.id, true)
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = selectedDocument.name
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Unable to download document.')
+    }
+  }
+
   return (
     <Modal open onClose={() => setSelectedDocument(null)} title={selectedDocument.name}>
       <div className="flex items-center justify-between rounded-2xl border border-[#eef2f7] bg-[#f8fbff] p-3 shadow-[0_4px_16px_rgba(37,99,235,.04)]">
@@ -60,6 +114,29 @@ export default function DocumentPreviewModal() {
             <p className="text-[10px] text-slate-500">Current version {selectedDocument.currentVersionNumber ?? '—'} · {selectedDocument.visibility ?? 'private'}</p>
           </div>
         </div>
+        {selectedDocument.uploaded && <Button type="button" variant="secondary" size="sm" onClick={() => void downloadSelectedDocument()}><Download size={14} />Download</Button>}
+      </div>
+      <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white">
+        {previewable && loadingPreview && <div className="grid min-h-[320px] place-items-center text-xs font-semibold text-slate-500">Loading preview...</div>}
+        {previewable && previewError && <div className="flex min-h-[220px] flex-col items-center justify-center gap-3 p-5 text-center">
+          <AlertCircle size={20} className="text-amber-600" />
+          <p className="text-sm font-semibold text-slate-900">Preview is unavailable</p>
+          <p className="max-w-sm text-xs text-slate-500">{previewError}</p>
+          <Button type="button" variant="secondary" size="sm" onClick={() => void downloadSelectedDocument()}><Download size={14} />Download</Button>
+        </div>}
+        {previewable && previewUrl && !loadingPreview && !previewError && (
+          selectedDocument.type === 'PDF'
+            ? <iframe title={`Preview ${selectedDocument.name}`} src={previewUrl} className="h-[60vh] min-h-[360px] w-full bg-white" />
+            : ['TXT', 'CSV'].includes(selectedDocument.type)
+              ? <iframe title={`Preview ${selectedDocument.name}`} src={previewUrl} className="h-[50vh] min-h-[320px] w-full bg-white" />
+              : <div className="grid max-h-[60vh] min-h-[260px] place-items-center overflow-auto bg-slate-50 p-3"><img src={previewUrl} alt={selectedDocument.name} className="max-h-[56vh] max-w-full object-contain" /></div>
+        )}
+        {!previewable && <div className="flex min-h-[220px] flex-col items-center justify-center gap-3 p-5 text-center">
+          <FileText size={24} className="text-slate-400" />
+          <p className="text-sm font-semibold text-slate-900">Preview is not available for this file type</p>
+          <p className="max-w-sm text-xs text-slate-500">{selectedDocument.name} can still be downloaded as the original uploaded file.</p>
+          {selectedDocument.uploaded && <Button type="button" variant="secondary" size="sm" onClick={() => void downloadSelectedDocument()}><Download size={14} />Download</Button>}
+        </div>}
       </div>
       {reference && (
         <div className="mt-4 flex items-center gap-2 rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-[11px] font-semibold text-yellow-800">

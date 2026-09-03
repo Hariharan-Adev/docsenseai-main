@@ -747,13 +747,88 @@ class MultitenantArchitectureTests(unittest.TestCase):
         metrics = self.client.get("/metrics")
         self.assertEqual(metrics.status_code, 200)
         self.assertIn(
-            'rag_ingestion_stage_duration_ms{organization_id="org-a",stage="extraction"}',
+            'rag_ingestion_stage_duration_ms{stage="extraction"}',
             metrics.text,
         )
-        self.assertIn(
-            'rag_chunks_created_total{organization_id="org-b"}',
-            metrics.text,
+        self.assertIn("rag_chunks_created_total", metrics.text)
+        self.assertNotIn("organization_id", metrics.text)
+        self.assertNotIn("org-a", metrics.text)
+        self.assertNotIn("org-b", metrics.text)
+
+    def test_current_file_endpoint_reuses_stored_upload_and_enforces_acl(self) -> None:
+        accepted = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("preview.txt", b"preview body", "text/plain")},
+            headers={"Idempotency-Key": "preview-file"},
+        ).json()
+        self.assertTrue(ingestion_jobs.run_one("worker-preview-file"))
+        with database.get_connection() as connection:
+            before = connection.execute(
+                """SELECT COUNT(*) AS versions,
+                          COUNT(DISTINCT storage_key) AS storage_keys
+                   FROM document_versions"""
+            ).fetchone()
+
+        preview = self.client.get(f"/documents/{accepted['document_id']}/file")
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.content, b"preview body")
+        self.assertIn("inline", preview.headers["content-disposition"])
+        self.assertEqual(preview.headers["content-type"], "text/plain; charset=utf-8")
+
+        download = self.client.get(
+            f"/documents/{accepted['document_id']}/file?download=true"
         )
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("attachment", download.headers["content-disposition"])
+        with database.get_connection() as connection:
+            after = connection.execute(
+                """SELECT COUNT(*) AS versions,
+                          COUNT(DISTINCT storage_key) AS storage_keys
+                   FROM document_versions"""
+            ).fetchone()
+        self.assertEqual(dict(after), dict(before))
+
+        denied_users = [
+            {
+                "id": 11,
+                "email": "reader@example.com",
+                "organization_id": "org-a",
+                "role": "member",
+            },
+            {
+                "id": 20,
+                "email": "owner-b@example.com",
+                "organization_id": "org-b",
+                "role": "organization_admin",
+            },
+        ]
+        for user in denied_users:
+            self.current_user = user
+            for suffix in ("", "?download=true"):
+                with self.subTest(user=user["id"], suffix=suffix):
+                    with patch(
+                        "app.routes.documents.resolve_storage_key",
+                        side_effect=AssertionError(
+                            "storage lookup must not run before authorization"
+                        ),
+                    ):
+                        denied = self.client.get(
+                            f"/documents/{accepted['document_id']}/file{suffix}"
+                        )
+                    self.assertEqual(denied.status_code, 404)
+                    self.assertNotIn("preview.txt", denied.text)
+                    self.assertNotIn("preview body", denied.text)
+                    self.assertNotIn("storage_key", denied.text)
+
+        self.current_user = {
+            "id": 10,
+            "email": "owner@example.com",
+            "organization_id": "org-a",
+            "role": "organization_admin",
+        }
+        missing = self.client.get(f"/documents/{accepted['document_id'] + 999}/file")
+        self.assertEqual(missing.status_code, 404)
+        self.assertNotIn("preview.txt", missing.text)
 
     def test_deleted_content_reupload_reuses_embeddings_and_is_searchable(self) -> None:
         first = self.upload(b"restorable policy", "reupload-original").json()

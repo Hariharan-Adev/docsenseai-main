@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import re
-from typing import Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from time import perf_counter
+from typing import Iterable, Iterator
 
 from db.database import get_connection
 from app.services.document_access import READABLE_DOCUMENT_SQL
@@ -24,6 +27,10 @@ _UUID_CONVERSATION_ID = re.compile(
     r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _ALLOWED_METADATA_FILTERS = {"collection_id", "document_id", "version_id"}
+_CURRENT_DIAGNOSTIC: ContextVar["RagRequestDiagnostic | None"] = ContextVar(
+    "rag_request_diagnostic",
+    default=None,
+)
 
 
 def _safe_text(value: object) -> str:
@@ -67,6 +74,32 @@ def _safe_conversation_id(value: str | None) -> str | None:
     return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
+def current_diagnostic() -> "RagRequestDiagnostic | None":
+    """Return the request-local diagnostic when chat instrumentation is active."""
+    return _CURRENT_DIAGNOSTIC.get()
+
+
+@contextmanager
+def bind_diagnostic(diagnostic: "RagRequestDiagnostic | None") -> Iterator[None]:
+    """Make one diagnostic visible to nested retrieval helpers during a request."""
+    token = _CURRENT_DIAGNOSTIC.set(diagnostic)
+    try:
+        yield
+    finally:
+        _CURRENT_DIAGNOSTIC.reset(token)
+
+
+@contextmanager
+def trace_stage(name: str) -> Iterator[None]:
+    """Time a stage only when the current request opted into diagnostics."""
+    diagnostic = current_diagnostic()
+    if diagnostic is None:
+        yield
+        return
+    with diagnostic.time_stage(name):
+        yield
+
+
 @dataclass
 class RagRequestDiagnostic:
     """Safe internal trace; callers must opt in by passing an instance."""
@@ -92,6 +125,8 @@ class RagRequestDiagnostic:
     final_selected_context_chunk_ids: list[int] = field(default_factory=list)
     grounded: bool | None = None
     unavailable: bool | None = None
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    prompt_shape: dict[str, object] = field(default_factory=dict)
 
     def _reset_observations(self) -> None:
         """Prevent accidental instance reuse from mixing separate requests."""
@@ -113,6 +148,41 @@ class RagRequestDiagnostic:
         self.final_selected_context_chunk_ids.clear()
         self.grounded = None
         self.unavailable = None
+        self.timings_ms.clear()
+        self.prompt_shape.clear()
+
+    @contextmanager
+    def time_stage(self, name: str) -> Iterator[None]:
+        """Accumulate a named stage duration in milliseconds for latency analysis."""
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            elapsed_ms = (perf_counter() - started) * 1000
+            self.timings_ms[name] = round(
+                self.timings_ms.get(name, 0.0) + elapsed_ms,
+                3,
+            )
+
+    def record_stage_duration(self, name: str, duration_ms: float) -> None:
+        """Record externally measured stages such as the full route duration."""
+        self.timings_ms[name] = round(max(0.0, duration_ms), 3)
+
+    def record_prompt_shape(
+        self,
+        *,
+        final_context_source_count: int,
+        final_context_estimated_tokens: int,
+        prompt_estimated_tokens: int,
+        context_strategy: str,
+    ) -> None:
+        """Record safe prompt-size metadata without retaining prompt text."""
+        self.prompt_shape = {
+            "final_context_source_count": max(0, int(final_context_source_count)),
+            "final_context_estimated_tokens": max(0, int(final_context_estimated_tokens)),
+            "prompt_estimated_tokens": max(0, int(prompt_estimated_tokens)),
+            "context_strategy": _safe_text(context_strategy),
+        }
 
     def start_request(
         self,
@@ -295,6 +365,8 @@ class RagRequestDiagnostic:
             "final_selected_context_chunk_ids": list(self.final_selected_context_chunk_ids),
             "grounded": self.grounded,
             "unavailable": self.unavailable,
+            "timings_ms": dict(self.timings_ms),
+            "prompt_shape": dict(self.prompt_shape),
         }
 
 
@@ -503,4 +575,6 @@ def authorized_diagnostic_payload(
         "grounded": trace["grounded"],
         "unavailable": unavailable,
         "unavailable_reason": trace["routing_reason"] if unavailable else None,
+        "timings_ms": trace["timings_ms"],
+        "prompt_shape": trace["prompt_shape"],
     }

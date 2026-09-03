@@ -20,6 +20,7 @@ export interface PolicyDocument {
   collectionId?: number | null
   collectionName?: string | null
   projectId?: string | null
+  projectName?: string | null
   relativePath?: string | null
   visibility?: 'private' | 'organization'
   processingStatus?: string

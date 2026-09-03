@@ -50,6 +50,8 @@ class RagRequestDiagnosticTests(unittest.TestCase):
                 "final_selected_context_chunk_ids",
                 "grounded",
                 "unavailable",
+                "timings_ms",
+                "prompt_shape",
             },
         )
         serialized = json.dumps(payload).casefold()
@@ -394,3 +396,37 @@ class RagRequestDiagnosticTests(unittest.TestCase):
             version_id=None,
         )
         self.assertTrue(str(diagnostic.to_dict()["conversation_id"]).startswith("sha256:"))
+
+    def test_timings_accumulate_without_content(self) -> None:
+        diagnostic = RagRequestDiagnostic()
+
+        with diagnostic.time_stage("embedding_creation_ms"):
+            pass
+        diagnostic.record_stage_duration("total_chat_request_ms", 12.3456)
+
+        payload = diagnostic.to_dict()
+        self.assertIn("embedding_creation_ms", payload["timings_ms"])
+        self.assertEqual(payload["timings_ms"]["total_chat_request_ms"], 12.346)
+        self.assertNotIn("content", payload["timings_ms"])
+
+    def test_prompt_shape_records_only_safe_counts(self) -> None:
+        diagnostic = RagRequestDiagnostic()
+
+        diagnostic.record_prompt_shape(
+            final_context_source_count=1,
+            final_context_estimated_tokens=200,
+            prompt_estimated_tokens=260,
+            context_strategy="simple_fact_excerpt",
+        )
+
+        payload = diagnostic.to_dict()
+        self.assertEqual(
+            payload["prompt_shape"],
+            {
+                "final_context_source_count": 1,
+                "final_context_estimated_tokens": 200,
+                "prompt_estimated_tokens": 260,
+                "context_strategy": "simple_fact_excerpt",
+            },
+        )
+        self.assertNotIn("prompt", payload["prompt_shape"])

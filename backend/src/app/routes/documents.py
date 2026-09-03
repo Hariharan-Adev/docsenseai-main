@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.auth import get_current_user
@@ -129,12 +131,23 @@ def list_documents(
             SELECT d.id, d.display_filename, d.uploaded_at, d.visibility,
                    d.owner_id, d.collection_id, d.upload_batch_id, d.relative_path,
                    d.processing_status, d.current_version_id, d.project_id,
-                   d.folder_id, dc.name AS collection_name, f.name AS folder_name,
+                   d.folder_id, dc.name AS collection_name, p.name AS project_name,
+                   f.name AS folder_name,
                    dv.version_number,
                    COALESCE(COUNT(c.id), 0) AS chunk_count
             FROM documents d
             LEFT JOIN document_collections dc ON dc.id = d.collection_id
-            LEFT JOIN folders f ON f.id = d.folder_id AND f.deleted_at IS NULL
+            LEFT JOIN projects p
+              ON p.id = d.project_id
+             AND p.organization_id = d.organization_id
+             AND p.user_id = d.owner_id
+             AND p.deleted_at IS NULL
+            LEFT JOIN folders f
+              ON f.id = d.folder_id
+             AND f.project_id = d.project_id
+             AND f.organization_id = d.organization_id
+             AND f.user_id = d.owner_id
+             AND f.deleted_at IS NULL
             LEFT JOIN document_versions dv ON dv.id = d.current_version_id
             LEFT JOIN chunks c ON c.version_id = dv.id AND c.deleted_at IS NULL
             WHERE {READABLE_DOCUMENT_SQL}
@@ -172,6 +185,7 @@ def list_documents(
                 "current_version_id": row["current_version_id"],
                 "current_version_number": row["version_number"],
                 "project_id": row["project_id"],
+                "project_name": row["project_name"],
                 "folder_id": row["folder_id"],
                 "folder_name": row["folder_name"],
             }
@@ -221,6 +235,51 @@ def get_document(
             "current_version": _version_dict(version) if version else None,
         }
     }
+
+
+@router.get("/{document_id}/file")
+def get_document_file(
+    document_id: int,
+    download: bool = Query(default=False),
+    current_user: dict[str, object] = Depends(get_current_user),
+) -> FileResponse:
+    """Return the stored current file after the standard read ACL check."""
+    with get_connection() as connection:
+        document = require_document(connection, document_id, current_user)
+        version = connection.execute(
+            """SELECT stored_filename, storage_key, mime_type
+               FROM document_versions
+               WHERE id = ? AND document_id = ? AND organization_id = ?
+                 AND deleted_at IS NULL""",
+            (
+                document["current_version_id"],
+                document_id,
+                current_user["organization_id"],
+            ),
+        ).fetchone()
+    if version is None:
+        raise HTTPException(status_code=404, detail="Document file was not found.")
+
+    try:
+        file_path = resolve_storage_key(
+            str(version["storage_key"] or version["stored_filename"])
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Document file was not found.") from None
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Document file was not found.")
+
+    media_type = (
+        version["mime_type"]
+        or mimetypes.guess_type(str(document["display_filename"]))[0]
+        or "application/octet-stream"
+    )
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=str(document["display_filename"]),
+        content_disposition_type="attachment" if download else "inline",
+    )
 
 
 @router.get("/{document_id}/versions")

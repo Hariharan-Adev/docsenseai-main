@@ -1231,10 +1231,14 @@ def _migrate_projects_v15(connection: sqlite3.Connection) -> None:
     )
     for table in ("documents", "chunks", "chat_sessions", "chat_contexts"):
         _add_column(connection, table, "project_id", "TEXT")
+    _dedupe_active_project_names_v15(connection)
     connection.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_projects_owner_updated
             ON projects(organization_id, user_id, deleted_at, updated_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_active_name
+            ON projects(organization_id, user_id, lower(name))
+            WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_documents_project
             ON documents(organization_id, owner_id, project_id, deleted_at);
         CREATE INDEX IF NOT EXISTS idx_chat_sessions_project
@@ -1247,6 +1251,36 @@ def _migrate_projects_v15(connection: sqlite3.Connection) -> None:
         """INSERT OR IGNORE INTO schema_migrations (version)
            VALUES ('015_projects')"""
     )
+
+
+def _dedupe_active_project_names_v15(connection: sqlite3.Connection) -> None:
+    """Normalize legacy project names so the new unique index can be applied safely."""
+    rows = connection.execute(
+        """SELECT id, organization_id, user_id, name
+           FROM projects
+           WHERE deleted_at IS NULL
+           ORDER BY organization_id, user_id, created_at, id"""
+    ).fetchall()
+    used_names: dict[tuple[str, int], set[str]] = {}
+    for row in rows:
+        owner_key = (str(row["organization_id"]), int(row["user_id"]))
+        used = used_names.setdefault(owner_key, set())
+        normalized = " ".join(str(row["name"] or "").split()) or "Untitled Project"
+        candidate = normalized[:100]
+        suffix_number = 2
+        while candidate.casefold() in used:
+            suffix = f" (duplicate {suffix_number})"
+            candidate = f"{normalized[:100 - len(suffix)]}{suffix}"
+            suffix_number += 1
+        used.add(candidate.casefold())
+        if candidate != row["name"]:
+            connection.execute(
+                """UPDATE projects
+                   SET name = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND organization_id = ? AND user_id = ?
+                     AND deleted_at IS NULL""",
+                (candidate, row["id"], row["organization_id"], row["user_id"]),
+            )
 
 
 def _migrate_project_folders_v16(connection: sqlite3.Connection) -> None:
