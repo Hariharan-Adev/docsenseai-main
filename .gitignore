@@ -1,8 +1,10 @@
 .env
 .env.local
+config.ini
 
 # Python
 backend/.env
+backend/config.ini
 backend/venv/
 backend/.venv312/
 venv/
@@ -39,6 +41,7 @@ node_modules/
 .vite/
 backend/node_modules/
 frontend/node_modules/
+frontend/public/app-config.ini
 dist/
 frontend/dist/
 .docx_review/

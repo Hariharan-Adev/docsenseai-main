@@ -1,5 +1,8 @@
-"""Application settings loaded from .env."""
+"""Application settings loaded from INI, environment, and .env."""
 
+import configparser
+import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 from pydantic import Field
@@ -35,6 +38,27 @@ _PLACEHOLDER_VALUES = {
 def _csv_values(value: str) -> list[str]:
     """Parse comma-separated environment values while ignoring blanks."""
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _default_ini_path() -> Path:
+    """Locate the deploy-time backend configuration file."""
+    return Path(__file__).resolve().parents[2] / "config.ini"
+
+
+def _load_ini_environment() -> None:
+    """Load config.ini values before Settings while preserving real env overrides."""
+    ini_path = Path(os.environ.get("APP_CONFIG_INI", "") or _default_ini_path())
+    if not ini_path.exists():
+        return
+
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str
+    parser.read(ini_path, encoding="utf-8")
+    for section in parser.sections():
+        for key, value in parser.items(section):
+            env_key = key.strip().upper()
+            if env_key and env_key not in os.environ:
+                os.environ[env_key] = value.strip()
 
 
 def _is_placeholder(value: str) -> bool:
@@ -284,4 +308,5 @@ class Settings(BaseSettings):
             self._validate_required_secret("GROQ_API_KEY", self.groq_api_key, problems)
 
 
+_load_ini_environment()
 settings = Settings()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.config import Settings
+from app.config import Settings, _load_ini_environment
 from app.main import apply_security_headers
 from app.routes import health
 from db import database
@@ -55,6 +56,37 @@ def request_for(scheme: str, forwarded_proto: str = "") -> Request:
 
 
 class DeploymentSecurityTests(unittest.TestCase):
+    def test_ini_configuration_loads_before_settings_without_overriding_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ini_path = Path(temporary) / "config.ini"
+            ini_path.write_text(
+                "[app]\n"
+                "APP_ENVIRONMENT=production\n"
+                "API_BASE_URL=https://api-from-ini.example.com\n"
+                "CORS_ALLOW_ORIGINS=https://app-from-ini.example.com\n",
+                encoding="utf-8",
+            )
+
+            keys = ("APP_CONFIG_INI", "APP_ENVIRONMENT", "API_BASE_URL", "CORS_ALLOW_ORIGINS")
+            old_values = {key: os.environ.get(key) for key in keys}
+            try:
+                for key in keys:
+                    os.environ.pop(key, None)
+                os.environ["APP_CONFIG_INI"] = str(ini_path)
+                os.environ["API_BASE_URL"] = "https://api-from-env.example.com"
+
+                _load_ini_environment()
+
+                self.assertEqual(os.environ["APP_ENVIRONMENT"], "production")
+                self.assertEqual(os.environ["CORS_ALLOW_ORIGINS"], "https://app-from-ini.example.com")
+                self.assertEqual(os.environ["API_BASE_URL"], "https://api-from-env.example.com")
+            finally:
+                for key in keys:
+                    if old_values[key] is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old_values[key]
+
     def test_production_settings_accept_explicit_https_controls(self) -> None:
         production_settings().validate_production_settings()
 

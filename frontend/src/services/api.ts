@@ -1,8 +1,9 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const DEFAULT_API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp'])
 const INGESTION_WAIT_TIMEOUT_MS = 5 * 60 * 1000
 
 let accessToken = ''
+let apiBaseUrlPromise: Promise<string> | null = null
 
 export class ApiError extends Error {
   status: number
@@ -262,6 +263,39 @@ function authHeaders(): HeadersInit {
   return accessToken ? { Authorization: `Bearer ${accessToken}` } : {}
 }
 
+function normalizeApiBaseUrl(value: string) {
+  // Keep request URLs stable when the INI value includes a trailing slash.
+  return value.trim().replace(/\/+$/, '') || DEFAULT_API_BASE_URL
+}
+
+function readIniValue(source: string, wantedKeys: string[]) {
+  // The frontend file is public, so only non-secret browser settings belong here.
+  const wanted = new Set(wantedKeys.map(key => key.toUpperCase()))
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';') || line.startsWith('[')) continue
+    const separator = line.indexOf('=')
+    if (separator === -1) continue
+    const key = line.slice(0, separator).trim().toUpperCase()
+    if (wanted.has(key)) return line.slice(separator + 1).trim()
+  }
+  return ''
+}
+
+async function getApiBaseUrl() {
+  // Read the publish-time frontend INI once; fall back to Vite env/local defaults.
+  if (!apiBaseUrlPromise) {
+    apiBaseUrlPromise = fetch('/app-config.ini', { cache: 'no-store' })
+      .then(async response => {
+        if (!response.ok) return DEFAULT_API_BASE_URL
+        const value = readIniValue(await response.text(), ['API_BASE_URL', 'VITE_API_BASE_URL'])
+        return normalizeApiBaseUrl(value || DEFAULT_API_BASE_URL)
+      })
+      .catch(() => DEFAULT_API_BASE_URL)
+  }
+  return apiBaseUrlPromise
+}
+
 async function readError(response: Response, fallback: string) {
   try {
     const body = await response.json() as {
@@ -282,7 +316,8 @@ async function readError(response: Response, fallback: string) {
 }
 
 async function requestJson<T>(path: string, options: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, options)
+  const apiBaseUrl = await getApiBaseUrl()
+  const response = await fetch(`${apiBaseUrl}${path}`, options)
 
   if (!response.ok) {
     const error = await readError(response, 'Request failed.')
@@ -719,7 +754,8 @@ export async function deleteDocument(documentId: string) {
 export async function fetchDocumentFile(documentId: string, download = false) {
   // File previews use bearer-authenticated fetches because object URLs cannot send headers.
   const query = download ? '?download=true' : ''
-  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/file${query}`, {
+  const apiBaseUrl = await getApiBaseUrl()
+  const response = await fetch(`${apiBaseUrl}/documents/${encodeURIComponent(documentId)}/file${query}`, {
     method: 'GET',
     headers: authHeaders(),
   })

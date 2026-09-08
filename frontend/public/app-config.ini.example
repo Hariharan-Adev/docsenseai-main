@@ -1,0 +1,5 @@
+; Copy this file to frontend/public/app-config.ini before building, or place it
+; beside index.html inside the published dist folder. Do not put secrets here.
+
+[frontend]
+API_BASE_URL=http://127.0.0.1:8000
