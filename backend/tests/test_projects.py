@@ -46,7 +46,7 @@ class ProjectTableTests(unittest.TestCase):
             "role": "organization_admin",
         }
         app.dependency_overrides[get_current_user] = lambda: self.current_user
-        self.client = TestClient(app)
+        self.client = TestClient(app, base_url="http://localhost")
 
     def tearDown(self) -> None:
         """Release the test client, dependency override, and temporary database."""
@@ -185,14 +185,6 @@ class ProjectTableTests(unittest.TestCase):
             "organization_id": "org-a",
             "role": "organization_admin",
         }
-        updated = self.client.patch(
-            f"/projects/{project['id']}",
-            json={"name": "Client A", "description": None},
-        )
-        self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.json()["name"], "Client A")
-        self.assertIsNone(updated.json()["description"])
-
         deleted = self.client.delete(f"/projects/{project['id']}")
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(deleted.json()["documents_deleted"], False)
@@ -232,20 +224,41 @@ class ProjectTableTests(unittest.TestCase):
         same_name_other_owner = self.client.post("/projects", json={"name": "asrc"})
         self.assertEqual(same_name_other_owner.status_code, 201)
 
-    def test_project_rename_rejects_duplicate_name(self) -> None:
-        """Renaming cannot bypass the project-name uniqueness rule."""
-        first = self.client.post("/projects", json={"name": "ASRC"}).json()
-        second = self.client.post("/projects", json={"name": "Finance"}).json()
+    def test_project_api_accepts_same_domain_api_prefix(self) -> None:
+        """The API prefix alias supports proxies that forward /api unchanged."""
+        created = self.client.post("/api/projects", json={"name": "Support"})
+        self.assertEqual(created.status_code, 201)
 
-        duplicate = self.client.patch(
-            f"/projects/{second['id']}",
-            json={"name": " asrc "},
+        listed = self.client.get("/api/projects")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["projects"][0]["id"], created.json()["id"])
+
+    def test_removed_project_management_apis_are_unavailable(self) -> None:
+        """Project settings and sharing cannot be reached through direct API calls."""
+        project = self.client.post("/projects", json={"name": "ASRC"}).json()
+
+        settings = self.client.patch(
+            f"/projects/{project['id']}",
+            json={"name": "Renamed"},
+        )
+        share = self.client.post(
+            f"/projects/{project['id']}/share",
+            json={"email": "reader@example.com"},
+        )
+        api_settings = self.client.patch(
+            f"/api/projects/{project['id']}",
+            json={"name": "Renamed"},
+        )
+        api_share = self.client.post(
+            f"/api/projects/{project['id']}/share",
+            json={"email": "reader@example.com"},
         )
 
-        self.assertEqual(duplicate.status_code, 409)
-        self.assertEqual(duplicate.json()["detail"], "Project name already exists.")
-        self.assertEqual(self.client.get(f"/projects/{first['id']}").json()["name"], "ASRC")
-        self.assertEqual(self.client.get(f"/projects/{second['id']}").json()["name"], "Finance")
+        self.assertEqual(settings.status_code, 405)
+        self.assertEqual(share.status_code, 404)
+        self.assertEqual(api_settings.status_code, 405)
+        self.assertEqual(api_share.status_code, 404)
+        self.assertEqual(self.client.get(f"/projects/{project['id']}").json()["name"], "ASRC")
 
     def test_folder_crud_enforces_project_scope_and_soft_deletes(self) -> None:
         """Folders are unique within one project and invisible after soft delete."""

@@ -1,4 +1,4 @@
-import { FolderKanban, Menu, MoreHorizontal, Pin, Plus, Search, Settings, Share2, Trash2 } from 'lucide-react'
+import { FolderKanban, Menu, MoreHorizontal, Pin, Plus, Search, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState, type FormEvent, type MouseEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
@@ -6,7 +6,7 @@ import { deleteProject as deleteProjectApi, type ProjectRecord } from '../servic
 import { Button } from './ui/Button'
 import { Modal } from './ui/Modal'
 
-type ProjectFilter = 'all' | 'created' | 'shared'
+type ProjectFilter = 'all' | 'created'
 
 // Keep project timestamps compact and readable while tolerating legacy API values.
 function projectUpdatedAt(value: string) {
@@ -18,7 +18,7 @@ function normalizedProjectName(value: string) {
   return value.trim().replace(/\s+/g, ' ').toLowerCase()
 }
 
-// The projects index keeps unsupported project-management actions local and explicit.
+// The projects index exposes only the project actions supported by the API.
 export default function ProjectsPage() {
   const { projects, createProject, selectedProjectId, setSelectedProjectId, setSelectedFolderId, setSelectedCollectionId, setSelectedDocument, setSidebarOpen, showToast } = useApp()
   const navigate = useNavigate()
@@ -30,18 +30,11 @@ export default function ProjectsPage() {
   const [creating, setCreating] = useState(false)
   const [actionsProjectId, setActionsProjectId] = useState<string | null>(null)
   const [pinnedProjectIds, setPinnedProjectIds] = useState<Set<string>>(() => new Set())
-  const [settingsProject, setSettingsProject] = useState<ProjectRecord | null>(null)
-  const [settingsName, setSettingsName] = useState('')
-  const [instructions, setInstructions] = useState('')
-  const [memory, setMemory] = useState('default')
-  const [libraryEnabled, setLibraryEnabled] = useState(true)
   const [deleteProject, setDeleteProject] = useState<ProjectRecord | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deletedProjectIds, setDeletedProjectIds] = useState<Set<string>>(() => new Set())
 
   const visibleProjects = useMemo(() => {
-    // The current API returns owner-created projects only, so Shared stays empty.
-    if (filter === 'shared') return []
     const query = search.trim().toLowerCase()
     return projects
       .filter(project => !deletedProjectIds.has(project.id))
@@ -108,23 +101,6 @@ export default function ProjectsPage() {
     setActionsProjectId(null)
   }
 
-  // Settings remain editable locally without implying unsupported persistence.
-  const openSettings = (project: ProjectRecord) => {
-    setSettingsProject(project)
-    setSettingsName(project.name)
-    setInstructions('')
-    setMemory('default')
-    setLibraryEnabled(true)
-    setActionsProjectId(null)
-  }
-
-  const saveSettings = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!settingsName.trim()) return
-    setSettingsProject(null)
-    showToast('Project settings changes are not available yet.')
-  }
-
   // Keep the confirmation open on failure and hide the deleted project immediately on success.
   const confirmDelete = async () => {
     if (!deleteProject || deleting) return
@@ -160,7 +136,7 @@ export default function ProjectsPage() {
       <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="relative min-w-0 flex-1 sm:max-w-sm"><Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search projects" className="h-10 w-full rounded-xl border border-[#e6ecf5] bg-white pl-9 pr-3 text-[12px] outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60" /></div>
         <div className="flex gap-1 overflow-x-auto">
-          {([['all', 'All'], ['created', 'Created by you'], ['shared', 'Shared with you']] as const).map(([value, label]) => <button key={value} type="button" onClick={() => setFilter(value)} className={`shrink-0 rounded-lg px-3 py-2 text-[11px] font-semibold ${filter === value ? 'bg-blue-50 text-blue-700' : 'text-slate-500 hover:bg-white hover:text-slate-800'}`}>{label}</button>)}
+          {([['all', 'All'], ['created', 'Created by you']] as const).map(([value, label]) => <button key={value} type="button" onClick={() => setFilter(value)} className={`shrink-0 rounded-lg px-3 py-2 text-[11px] font-semibold ${filter === value ? 'bg-blue-50 text-blue-700' : 'text-slate-500 hover:bg-white hover:text-slate-800'}`}>{label}</button>)}
         </div>
       </div>
 
@@ -173,28 +149,16 @@ export default function ProjectsPage() {
           <button type="button" onPointerDown={event => event.stopPropagation()} onClick={event => toggleActions(event, project.id)} className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-blue-50 hover:text-blue-600" aria-label={`Actions for ${project.name}`} aria-expanded={actionsProjectId === project.id}><MoreHorizontal size={16} /></button>
           {actionsProjectId === project.id && <div onPointerDown={event => event.stopPropagation()} onClick={event => event.stopPropagation()} className="absolute right-3 top-11 z-20 w-48 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg" role="menu">
             <button type="button" onClick={() => togglePin(project.id)} className="flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-[11px] font-medium text-slate-600 hover:bg-blue-50 hover:text-blue-600"><Pin size={14} />{pinnedProjectIds.has(project.id) ? 'Unpin Project' : 'Pin Project'}</button>
-            <button type="button" onClick={() => { setActionsProjectId(null); showToast('Project sharing is not available yet.') }} className="flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-[11px] font-medium text-slate-600 hover:bg-blue-50 hover:text-blue-600"><Share2 size={14} />Share</button>
-            <button type="button" onClick={() => openSettings(project)} className="flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-[11px] font-medium text-slate-600 hover:bg-blue-50 hover:text-blue-600"><Settings size={14} />Project Settings</button>
             <button type="button" onClick={() => { setActionsProjectId(null); setDeleteProject(project) }} className="flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-[11px] font-medium text-red-600 hover:bg-red-50"><Trash2 size={14} />Delete Project</button>
           </div>}
         </div>)}
-      </div> : <div className="py-10 text-center"><FolderKanban className="mx-auto text-slate-300" size={26} /><p className="mt-2 text-[12px] font-semibold text-slate-600">{filter === 'shared' ? 'No projects have been shared with you.' : search ? 'No matching projects.' : 'No projects yet.'}</p>{filter !== 'shared' && !search && <button type="button" onClick={() => setCreateOpen(true)} className="mt-3 text-[11px] font-semibold text-blue-600 hover:text-blue-700">Create your first project</button>}</div>}
+      </div> : <div className="py-10 text-center"><FolderKanban className="mx-auto text-slate-300" size={26} /><p className="mt-2 text-[12px] font-semibold text-slate-600">{search ? 'No matching projects.' : 'No projects yet.'}</p>{!search && <button type="button" onClick={() => setCreateOpen(true)} className="mt-3 text-[11px] font-semibold text-blue-600 hover:text-blue-700">Create your first project</button>}</div>}
     </div>
 
     <Modal open={createOpen} onClose={() => { if (!creating) { setCreateOpen(false); setProjectName(''); setProjectNameError('') } }} title="Create project">
       <form onSubmit={submitCreateProject} className="flex w-full flex-col gap-5">
         <div className="w-full space-y-2"><label htmlFor="project-name" className="block text-xs font-semibold text-slate-700">Project name</label><input id="project-name" autoFocus value={projectName} onChange={event => { setProjectName(event.target.value); setProjectNameError('') }} placeholder="Enter project name" className="field h-11 w-full" maxLength={100} aria-invalid={projectNameError ? 'true' : undefined} aria-describedby={projectNameError ? 'project-name-error' : 'project-name-help'} />{projectNameError ? <p id="project-name-error" className="text-[11px] leading-5 text-red-600">{projectNameError}</p> : <p id="project-name-help" className="text-[11px] leading-5 text-slate-500">Projects keep related chats, documents, and files together in one place.</p>}</div>
         <div className="flex w-full justify-end gap-2"><Button type="button" variant="secondary" size="sm" disabled={creating} onClick={() => { setCreateOpen(false); setProjectName(''); setProjectNameError('') }}>Cancel</Button><Button type="submit" size="sm" disabled={!projectName.trim() || creating}>{creating ? 'Creating...' : 'Create project'}</Button></div>
-      </form>
-    </Modal>
-
-    <Modal open={settingsProject !== null} onClose={() => setSettingsProject(null)} title="Project settings">
-      <form onSubmit={saveSettings} className="flex w-full flex-col gap-5">
-        <div className="w-full space-y-2"><label htmlFor="settings-project-name" className="block text-xs font-semibold text-slate-700">Project Name</label><input id="settings-project-name" value={settingsName} onChange={event => setSettingsName(event.target.value)} className="field h-11 w-full" maxLength={100} /></div>
-        <div className="w-full space-y-2"><label htmlFor="project-instructions" className="block text-xs font-semibold text-slate-700">Instructions</label><textarea id="project-instructions" value={instructions} onChange={event => setInstructions(event.target.value)} rows={4} className="field w-full resize-y py-3" placeholder="Add instructions for work in this project" /><p className="text-[10px] leading-4 text-slate-400">Set context and customize how responses behave in this project.</p></div>
-        <div className="w-full space-y-2"><label htmlFor="project-memory" className="block text-xs font-semibold text-slate-700">Memory</label><select id="project-memory" value={memory} onChange={event => setMemory(event.target.value)} className="field h-11 w-full"><option value="default">Default memory</option></select><p className="text-[10px] leading-4 text-slate-400">Default memory follows your current Docsense conversation behavior.</p></div>
-        <label className="flex w-full items-start justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50/60 p-3"><span><span className="block text-xs font-semibold text-slate-700">Library Access</span><span className="mt-1 block text-[10px] leading-4 text-slate-400">{libraryEnabled ? 'Enabled' : 'Disabled'}</span></span><input type="checkbox" checked={libraryEnabled} onChange={event => setLibraryEnabled(event.target.checked)} className="mt-1 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /></label>
-        <div className="flex w-full flex-col gap-3 border-t border-slate-200 pt-5 sm:flex-row sm:items-center sm:justify-between"><Button type="button" variant="danger" size="sm" className="self-start" onClick={() => { if (settingsProject) setDeleteProject(settingsProject); setSettingsProject(null) }}><Trash2 size={14} />Delete project</Button><div className="ml-auto flex gap-2"><Button type="button" variant="secondary" size="sm" onClick={() => setSettingsProject(null)}>Cancel</Button><Button type="submit" size="sm" disabled={!settingsName.trim()}>Save</Button></div></div>
       </form>
     </Modal>
 

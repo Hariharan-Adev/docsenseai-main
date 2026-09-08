@@ -101,6 +101,23 @@ app.include_router(chat_router)
 app.include_router(collections_router)
 app.include_router(projects_router)
 
+# Accept same-domain deployments where the proxy forwards /api/* unchanged.
+# Existing unprefixed and /api upload/job routes remain registered above.
+for api_alias_router in (
+    auth_router,
+    azure_devops_router,
+    upload_router,
+    documents_router,
+    images_router,
+    ingestion_router,
+    health_router,
+    search_router,
+    chat_router,
+    collections_router,
+    projects_router,
+):
+    app.include_router(api_alias_router, prefix="/api", include_in_schema=False)
+
 
 @app.on_event("startup")
 def startup() -> None:

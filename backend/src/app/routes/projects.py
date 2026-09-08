@@ -19,13 +19,6 @@ class ProjectCreate(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
 
 
-class ProjectUpdate(BaseModel):
-    """Editable project metadata."""
-
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=1000)
-
-
 class FolderCreate(BaseModel):
     """Validated fields for a new folder inside a project."""
 
@@ -65,22 +58,15 @@ def _normalized_name(value: str, label: str) -> str:
     return name
 
 
-def _project_name_exists(name: str, user: dict[str, object], excluded_project_id: str | None = None) -> bool:
+def _project_name_exists(name: str, user: dict[str, object]) -> bool:
     """Check active project-name uniqueness inside the authenticated owner scope."""
     with get_connection() as connection:
         return connection.execute(
             """SELECT 1 FROM projects
                WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL
                  AND lower(name) = lower(?)
-                 AND (? IS NULL OR id != ?)
                LIMIT 1""",
-            (
-                user["organization_id"],
-                user["id"],
-                name,
-                excluded_project_id,
-                excluded_project_id,
-            ),
+            (user["organization_id"], user["id"], name),
         ).fetchone() is not None
 
 
@@ -176,32 +162,6 @@ def list_projects(current_user=Depends(get_current_user)):
 @router.get("/{project_id}")
 def get_project(project_id: str, current_user=Depends(get_current_user)):
     """Return one owner-scoped project."""
-    return dict(require_project(project_id, current_user))
-
-
-@router.patch("/{project_id}")
-def update_project(project_id: str, payload: ProjectUpdate, current_user=Depends(get_current_user)):
-    """Update project metadata while retaining ownership and stable identity."""
-    require_project(project_id, current_user)
-    name = _normalized_name(payload.name, "Project name") if payload.name is not None else None
-    if name is not None and _project_name_exists(name, current_user, project_id):
-        raise HTTPException(status_code=409, detail="Project name already exists.")
-    # Explicit null clears the optional description; omitted fields preserve it.
-    description_provided = "description" in payload.model_fields_set
-    try:
-        with get_connection() as connection:
-            connection.execute(
-                """UPDATE projects SET name = COALESCE(?, name),
-                       description = CASE WHEN ? THEN ? ELSE description END,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE id = ? AND organization_id = ? AND user_id = ? AND deleted_at IS NULL""",
-                (name, description_provided, payload.description, project_id,
-                 current_user["organization_id"], current_user["id"]),
-            )
-    except sqlite3.IntegrityError as error:
-        if "ux_projects_active_name" in str(error):
-            raise HTTPException(status_code=409, detail="Project name already exists.") from error
-        raise
     return dict(require_project(project_id, current_user))
 
 

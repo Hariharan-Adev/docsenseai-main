@@ -22,7 +22,7 @@ class PasswordResetFlowTests(unittest.TestCase):
         self.db_patch = patch.object(database, "DATABASE_PATH", self.database_path)
         self.db_patch.start()
         database.initialize_database()
-        self.client = TestClient(app)
+        self.client = TestClient(app, base_url="http://localhost")
         self.client.post(
             "/auth/register",
             json={
@@ -43,6 +43,16 @@ class PasswordResetFlowTests(unittest.TestCase):
             "/auth/login",
             data={"username": "owner@example.com", "password": password},
         )
+
+    def test_login_accepts_same_domain_api_prefix(self) -> None:
+        """Same-domain deployments may forward /api without stripping the prefix."""
+        response = self.client.post(
+            "/api/auth/login",
+            data={"username": "owner@example.com", "password": "original-password"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["token_type"], "bearer")
 
     def request_reset_token(self) -> str:
         """Request reset while controlling the generated one-time token."""
