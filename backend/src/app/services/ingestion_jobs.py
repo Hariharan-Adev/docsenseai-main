@@ -65,6 +65,16 @@ class ContentResolution:
     reusable_chunks: tuple[sqlite3.Row, ...] = ()
 
 
+@dataclass(frozen=True)
+class VideoTranscriptTarget:
+    """Identify the durable transcript document/version created for one video version."""
+
+    document_id: int
+    version_id: int
+    display_filename: str
+    storage_key: str | None = None
+
+
 def _video_source_metadata(source_chunks) -> dict[str, object]:
     """Describe a transcript without storing provider secrets or original media."""
     return {
@@ -74,6 +84,131 @@ def _video_source_metadata(source_chunks) -> dict[str, object]:
         "transcription_model": settings.groq_transcription_model,
         "segment_count": len(source_chunks),
     }
+
+
+def _ensure_video_transcript_target(
+    connection: sqlite3.Connection,
+    *,
+    job,
+    content_id: int,
+    extracted_text: str,
+    normalized_hash: str,
+    source_metadata: dict[str, object],
+) -> VideoTranscriptTarget:
+    """Create or reuse the one transcript document/version mapped to this video."""
+    existing = connection.execute(
+        """SELECT vt.transcript_version_id, d.id AS transcript_document_id,
+                  d.display_filename, dv.storage_key
+           FROM video_transcript_versions vt
+           JOIN document_versions dv ON dv.id = vt.transcript_version_id
+           JOIN documents d ON d.id = dv.document_id
+           WHERE vt.video_version_id = ? AND vt.organization_id = ?
+             AND d.owner_id = ?""",
+        (job["version_id"], job["organization_id"], job["owner_id"]),
+    ).fetchone()
+    if existing is not None:
+        return VideoTranscriptTarget(
+            int(existing["transcript_document_id"]),
+            int(existing["transcript_version_id"]),
+            str(existing["display_filename"]),
+            str(existing["storage_key"]) if existing["storage_key"] else None,
+        )
+
+    linked = connection.execute(
+        """SELECT d.id, d.display_filename
+           FROM video_transcript_documents link
+           JOIN documents d ON d.id = link.transcript_document_id
+           WHERE link.video_document_id = ? AND link.organization_id = ?
+             AND link.owner_id = ? AND d.deleted_at IS NULL""",
+        (job["document_id"], job["organization_id"], job["owner_id"]),
+    ).fetchone()
+    transcript_name = f"{Path(str(job['display_filename'])).stem}_transcript.txt"
+    transcript_bytes = extracted_text.encode("utf-8")
+    transcript_hash = sha256(transcript_bytes).hexdigest()
+    stored_filename = f"{uuid4().hex}.txt"
+    storage_key = storage_key_for(str(job["organization_id"]), stored_filename)
+
+    if linked is None:
+        display_filename = generate_unique_display_filename(
+            connection, int(job["owner_id"]), transcript_name
+        )
+        cursor = connection.execute(
+            """INSERT INTO documents
+               (owner_id, organization_id, original_filename, display_filename,
+                stored_filename, file_hash, content_id, visibility,
+                collection_id, upload_batch_id, relative_path,
+                processing_status, updated_at, project_id, folder_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'processing',
+                       CURRENT_TIMESTAMP, ?, ?)""",
+            (
+                job["owner_id"], job["organization_id"], transcript_name,
+                display_filename, stored_filename, transcript_hash, content_id,
+                job["visibility"], job["collection_id"],
+                display_filename, job["project_id"], job["folder_id"],
+            ),
+        )
+        transcript_document_id = int(cursor.lastrowid)
+        connection.execute(
+            """INSERT INTO video_transcript_documents
+               (video_document_id, transcript_document_id, organization_id, owner_id)
+               VALUES (?, ?, ?, ?)""",
+            (
+                job["document_id"], transcript_document_id,
+                job["organization_id"], job["owner_id"],
+            ),
+        )
+    else:
+        transcript_document_id = int(linked["id"])
+        display_filename = str(linked["display_filename"])
+        connection.execute(
+            """UPDATE documents SET processing_status = 'processing',
+                   processing_error = NULL, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+            (
+                transcript_document_id, job["organization_id"], job["owner_id"],
+            ),
+        )
+
+    version_number = int(connection.execute(
+        """SELECT COALESCE(MAX(version_number), 0) + 1
+           FROM document_versions WHERE document_id = ? AND organization_id = ?""",
+        (transcript_document_id, job["organization_id"]),
+    ).fetchone()[0])
+    metadata = {
+        **source_metadata,
+        "source_video_document_id": int(job["document_id"]),
+        "source_video_version_id": int(job["version_id"]),
+    }
+    cursor = connection.execute(
+        """INSERT INTO document_versions
+           (organization_id, document_id, version_number, content_id,
+            stored_filename, storage_key, mime_type, file_size, file_hash,
+            normalized_content_hash, status, ingestion_status,
+            extraction_status, indexing_status, source_metadata_json, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, 'text/plain; charset=utf-8', ?, ?, ?,
+                   'processing', 'processing', 'completed', 'queued', ?, ?)""",
+        (
+            job["organization_id"], transcript_document_id, version_number,
+            content_id, stored_filename, storage_key, len(transcript_bytes),
+            transcript_hash, normalized_hash, json.dumps(metadata), job["owner_id"],
+        ),
+    )
+    transcript_version_id = int(cursor.lastrowid)
+    connection.execute(
+        """INSERT INTO video_transcript_versions
+           (video_version_id, transcript_version_id, organization_id)
+           VALUES (?, ?, ?)""",
+        (job["version_id"], transcript_version_id, job["organization_id"]),
+    )
+    # Write after relational validation; a write failure rolls back every mapping.
+    try:
+        write_storage_bytes(storage_key, transcript_bytes)
+    except Exception:
+        resolve_storage_key(storage_key).unlink(missing_ok=True)
+        raise
+    return VideoTranscriptTarget(
+        transcript_document_id, transcript_version_id, display_filename, storage_key
+    )
 
 
 def _extract_bundle_child(
@@ -278,10 +413,48 @@ def _reusable_video_bundle(job, path: Path):
     if path.suffix.lower() not in VIDEO_EXTENSIONS:
         return None
     with get_connection() as connection:
+        current_transcript = connection.execute(
+            """SELECT vt.transcript_version_id, dv.source_metadata_json
+               FROM video_transcript_versions vt
+               JOIN document_versions dv ON dv.id = vt.transcript_version_id
+               JOIN documents d ON d.id = dv.document_id
+               WHERE vt.video_version_id = ? AND vt.organization_id = ?
+                 AND d.owner_id = ? AND d.deleted_at IS NULL""",
+            (job["version_id"], job["organization_id"], job["owner_id"]),
+        ).fetchone()
+        if current_transcript is not None:
+            current_rows = connection.execute(
+                """SELECT text, source_type, source_location_json
+                   FROM chunks WHERE organization_id = ? AND version_id = ?
+                     AND deleted_at IS NULL ORDER BY chunk_index""",
+                (
+                    job["organization_id"],
+                    current_transcript["transcript_version_id"],
+                ),
+            ).fetchall()
+            if current_rows:
+                try:
+                    chunks = [
+                        SourceChunk(
+                            str(row["text"]), str(row["source_type"] or "video"),
+                            json.loads(row["source_location_json"] or "{}"),
+                        )
+                        for row in current_rows
+                    ]
+                    metadata = json.loads(
+                        current_transcript["source_metadata_json"] or "{}"
+                    )
+                    return chunks, metadata or _video_source_metadata(chunks), None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
         version = connection.execute(
-            """SELECT dv.id, dv.source_metadata_json
+            """SELECT dv.id, dv.source_metadata_json,
+                      COALESCE(vt.transcript_version_id, dv.id) AS chunk_version_id
                FROM document_versions dv
                JOIN documents d ON d.id = dv.document_id
+               LEFT JOIN video_transcript_versions vt
+                 ON vt.video_version_id = dv.id
+                AND vt.organization_id = dv.organization_id
                WHERE dv.organization_id = ? AND d.owner_id = ?
                  AND dv.file_hash = ? AND dv.id <> ?
                  AND dv.status = 'completed' AND dv.deleted_at IS NULL
@@ -300,7 +473,7 @@ def _reusable_video_bundle(job, path: Path):
                WHERE organization_id = ? AND version_id = ?
                  AND deleted_at IS NULL
                ORDER BY chunk_index""",
-            (job["organization_id"], version["id"]),
+            (job["organization_id"], version["chunk_version_id"]),
         ).fetchall()
     if not rows:
         return None
@@ -617,9 +790,40 @@ def _fail_or_retry(
                 connection.execute(
                     """UPDATE documents SET processing_status = 'failed',
                        processing_error = ?
-                       WHERE id = ? AND current_version_id IS NULL""",
+                       WHERE id = ? AND (
+                           current_version_id IS NULL
+                           OR processing_status = 'video_processing'
+                       )""",
                     (safe_message, job["document_id"]),
                 )
+                transcript = connection.execute(
+                    """SELECT vt.transcript_version_id, dv.document_id
+                       FROM video_transcript_versions vt
+                       JOIN document_versions dv ON dv.id = vt.transcript_version_id
+                       WHERE vt.video_version_id = ? AND vt.organization_id = ?""",
+                    (job["version_id"], job["organization_id"]),
+                ).fetchone()
+                if transcript is not None:
+                    # A partially created derived document must never appear ready.
+                    connection.execute(
+                        """UPDATE document_versions SET status = 'failed',
+                           ingestion_status = 'failed', indexing_status = 'failed',
+                           processing_error_code = ?, processing_error_message = ?,
+                           failure_reason = ? WHERE id = ?""",
+                        (
+                            code, safe_message, safe_message,
+                            transcript["transcript_version_id"],
+                        ),
+                    )
+                    connection.execute(
+                        """UPDATE documents SET processing_status = 'failed',
+                           processing_error = ?, updated_at = CURRENT_TIMESTAMP
+                           WHERE id = ? AND organization_id = ?""",
+                        (
+                            safe_message, transcript["document_id"],
+                            job["organization_id"],
+                        ),
+                    )
                 if code == "DOCUMENT_ALREADY_EXISTS":
                     version = connection.execute(
                         "SELECT content_id FROM document_versions WHERE id = ?",
@@ -765,6 +969,26 @@ def _resume_existing_chunks(job) -> bool:
     if job["version_id"] is None or job["document_id"] is None:
         return False
     with get_connection() as connection:
+        transcript = connection.execute(
+            """SELECT vt.transcript_version_id, dv.document_id, d.display_filename
+               FROM video_transcript_versions vt
+               JOIN document_versions dv ON dv.id = vt.transcript_version_id
+               JOIN documents d ON d.id = dv.document_id
+               WHERE vt.video_version_id = ? AND vt.organization_id = ?
+                 AND d.owner_id = ?""",
+            (job["version_id"], job["organization_id"], job["owner_id"]),
+        ).fetchone()
+        target_document_id = (
+            int(transcript["document_id"]) if transcript else int(job["document_id"])
+        )
+        target_version_id = (
+            int(transcript["transcript_version_id"])
+            if transcript else int(job["version_id"])
+        )
+        target_filename = (
+            str(transcript["display_filename"])
+            if transcript else str(job["display_filename"])
+        )
         rows = connection.execute(
             """SELECT id, content_id, chunk_index, text, source_type,
                       source_location_json, vector_point_id, embedding_model,
@@ -773,7 +997,7 @@ def _resume_existing_chunks(job) -> bool:
                WHERE organization_id = ? AND document_id = ? AND version_id = ?
                  AND deleted_at IS NULL
                ORDER BY chunk_index""",
-            (job["organization_id"], job["document_id"], job["version_id"]),
+            (job["organization_id"], target_document_id, target_version_id),
         ).fetchall()
     if not rows or any(
         not row["vector_point_id"]
@@ -795,14 +1019,14 @@ def _resume_existing_chunks(job) -> bool:
             points.append(VectorPoint(
                 organization_id=str(job["organization_id"]),
                 owner_id=int(job["owner_id"]),
-                document_id=int(job["document_id"]),
-                version_id=int(job["version_id"]),
+                document_id=target_document_id,
+                version_id=target_version_id,
                 content_id=int(row["content_id"]),
                 chunk_id=int(row["id"]),
                 chunk_index=int(row["chunk_index"]),
                 vector=vector,
                 text=str(row["text"]),
-                filename=str(job["display_filename"]),
+                filename=target_filename,
                 visibility=str(job["visibility"]),
                 source_type=str(row["source_type"] or "text"),
                 source_location=json.loads(row["source_location_json"] or "{}"),
@@ -820,7 +1044,7 @@ def _resume_existing_chunks(job) -> bool:
         version = connection.execute(
             """SELECT content_id, normalized_content_hash
                FROM document_versions WHERE id = ? AND organization_id = ?""",
-            (job["version_id"], job["organization_id"]),
+            (target_version_id, job["organization_id"]),
         ).fetchone()
         if version is None:
             return False
@@ -843,7 +1067,7 @@ def _resume_existing_chunks(job) -> bool:
                    qdrant_indexed_at = CURRENT_TIMESTAMP
                WHERE organization_id = ? AND document_id = ? AND version_id = ?
                  AND deleted_at IS NULL""",
-            (job["organization_id"], job["document_id"], job["version_id"]),
+            (job["organization_id"], target_document_id, target_version_id),
         )
         connection.execute(
             """UPDATE document_versions
@@ -853,7 +1077,7 @@ def _resume_existing_chunks(job) -> bool:
                    processing_error_code = NULL, processing_error_message = NULL,
                    failure_reason = NULL
                WHERE id = ? AND organization_id = ?""",
-            (job["version_id"], job["organization_id"]),
+            (target_version_id, job["organization_id"]),
         )
         connection.execute(
             """UPDATE document_contents SET processing_status = 'completed'
@@ -871,10 +1095,29 @@ def _resume_existing_chunks(job) -> bool:
                    updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND organization_id = ?""",
             (
-                job["version_id"], version["content_id"], job["document_id"],
+                target_version_id, version["content_id"], target_document_id,
                 job["organization_id"],
             ),
         )
+        if transcript:
+            connection.execute(
+                """UPDATE document_versions SET status = 'completed',
+                   ingestion_status = 'completed', extraction_status = 'completed',
+                   indexing_status = 'completed', completed_at = CURRENT_TIMESTAMP,
+                   processing_error_code = NULL, processing_error_message = NULL,
+                   failure_reason = NULL WHERE id = ? AND organization_id = ?""",
+                (job["version_id"], job["organization_id"]),
+            )
+            connection.execute(
+                """UPDATE documents SET current_version_id = ?, content_id = ?,
+                   processing_status = 'completed', processing_error = NULL,
+                   updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND organization_id = ?""",
+                (
+                    job["version_id"], version["content_id"], job["document_id"],
+                    job["organization_id"],
+                ),
+            )
         connection.execute(
             """UPDATE ingestion_jobs
                SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
@@ -893,7 +1136,7 @@ def process_job(job_id: str) -> None:
     with get_connection() as connection:
         job = connection.execute(
             """SELECT j.*, d.display_filename, d.visibility, d.current_version_id,
-                      d.project_id, d.folder_id,
+                      d.project_id, d.folder_id, d.collection_id,
                       dv.file_hash AS expected_file_hash
                FROM ingestion_jobs j
                LEFT JOIN documents d ON d.id = j.document_id
@@ -932,6 +1175,7 @@ def process_job(job_id: str) -> None:
         _fail_or_retry(job_id, code, public_message, transient=transient)
         return
     failure_stage = "stored_upload_validation"
+    transcript_storage_key: str | None = None
     try:
         payload = json.loads(job["payload_json"])
         path = resolve_storage_key(
@@ -967,6 +1211,7 @@ def process_job(job_id: str) -> None:
         extracted_text = normalize_extracted_text("\n\n".join(texts))
         validate_extracted_text(extracted_text)
         normalized_hash = sha256(extracted_text.encode("utf-8")).hexdigest()
+        is_video = path.suffix.lower() in VIDEO_EXTENSIONS
         reused_existing_content = False
         reused_deleted_content = False
         embeddings: list[list[float]] = []
@@ -985,9 +1230,31 @@ def process_job(job_id: str) -> None:
                     "The deleted document could not be restored.",
                 )
             placeholder_content_id = int(version["content_id"])
+            transcript_target = None
+            index_job = dict(job)
+            if is_video:
+                transcript_target = _ensure_video_transcript_target(
+                    connection,
+                    job=job,
+                    content_id=placeholder_content_id,
+                    extracted_text=extracted_text,
+                    normalized_hash=normalized_hash,
+                    source_metadata=source_metadata,
+                )
+                transcript_storage_key = transcript_target.storage_key
+                index_job.update({
+                    "document_id": transcript_target.document_id,
+                    "version_id": transcript_target.version_id,
+                    "display_filename": transcript_target.display_filename,
+                })
+                source_metadata = {
+                    **source_metadata,
+                    "source_video_document_id": int(job["document_id"]),
+                    "source_video_version_id": int(job["version_id"]),
+                }
             resolution = _resolve_content(
                 connection,
-                job=job,
+                job=index_job,
                 placeholder_content_id=placeholder_content_id,
                 normalized_hash=normalized_hash,
                 source_chunks=source_chunks,
@@ -1017,7 +1284,7 @@ def process_job(job_id: str) -> None:
                     """UPDATE documents SET content_id = ?
                        WHERE id = ? AND organization_id = ? AND owner_id = ?""",
                     (
-                        content_id, job["document_id"], job["organization_id"],
+                        content_id, index_job["document_id"], job["organization_id"],
                         job["owner_id"],
                     ),
                 )
@@ -1025,8 +1292,22 @@ def process_job(job_id: str) -> None:
                     """UPDATE document_versions
                        SET content_id = ?
                        WHERE id = ? AND organization_id = ?""",
-                    (content_id, job["version_id"], job["organization_id"]),
+                    (content_id, index_job["version_id"], job["organization_id"]),
                 )
+                if is_video:
+                    connection.execute(
+                        """UPDATE document_versions SET content_id = ?
+                           WHERE id = ? AND organization_id = ?""",
+                        (content_id, job["version_id"], job["organization_id"]),
+                    )
+                    connection.execute(
+                        """UPDATE documents SET content_id = ?
+                           WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+                        (
+                            content_id, job["document_id"], job["organization_id"],
+                            job["owner_id"],
+                        ),
+                    )
                 connection.execute(
                     """DELETE FROM document_contents
                        WHERE id = ? AND organization_id = ? AND owner_id = ?""",
@@ -1058,19 +1339,19 @@ def process_job(job_id: str) -> None:
                    WHERE id = ? AND organization_id = ?""",
                 (
                     content_id, normalized_hash, json.dumps(source_metadata),
-                    job["version_id"], job["organization_id"],
+                    index_job["version_id"], job["organization_id"],
                 ),
             )
             chunk_ids = _insert_version_chunks(
                 connection,
-                job=job,
+                job=index_job,
                 content_id=content_id,
                 source_chunks=source_chunks,
             )
             if not reused_deleted_content:
                 structured_context = StructuredDocumentContext(
-                    document_id=int(job["document_id"]),
-                    version_id=int(job["version_id"]),
+                    document_id=int(index_job["document_id"]),
+                    version_id=int(index_job["version_id"]),
                     content_id=content_id,
                     owner_id=int(job["owner_id"]),
                     organization_id=str(job["organization_id"]),
@@ -1134,21 +1415,21 @@ def process_job(job_id: str) -> None:
                 """UPDATE document_versions
                    SET extraction_status = 'completed', indexing_status = 'processing'
                    WHERE id = ?""",
-                (job["version_id"],),
+                (index_job["version_id"],),
             )
 
         points = [
             VectorPoint(
                 organization_id=str(job["organization_id"]),
                 owner_id=int(job["owner_id"]),
-                document_id=int(job["document_id"]),
-                version_id=int(job["version_id"]),
+                document_id=int(index_job["document_id"]),
+                version_id=int(index_job["version_id"]),
                 content_id=content_id,
                 chunk_id=chunk_ids[index],
                 chunk_index=index,
                 vector=embeddings[index],
                 text=source.text,
-                filename=str(job["display_filename"]),
+                filename=str(index_job["display_filename"]),
                 visibility=str(job["visibility"]),
                 source_type=source.source_type,
                 source_location=source.location,
@@ -1185,8 +1466,8 @@ def process_job(job_id: str) -> None:
                        WHERE organization_id = ? AND document_id = ?
                          AND version_id = ? AND deleted_at IS NULL""",
                     (
-                        job["organization_id"], job["document_id"],
-                        job["version_id"],
+                        job["organization_id"], index_job["document_id"],
+                        index_job["version_id"],
                     ),
                 )
                 connection.execute(
@@ -1220,8 +1501,8 @@ def process_job(job_id: str) -> None:
                    WHERE organization_id = ? AND document_id = ? AND version_id = ?
                      AND deleted_at IS NULL""",
                 (
-                    job["organization_id"], job["document_id"],
-                    job["version_id"],
+                    job["organization_id"], index_job["document_id"],
+                    index_job["version_id"],
                 ),
             )
             connection.execute(
@@ -1232,8 +1513,26 @@ def process_job(job_id: str) -> None:
                    processing_error_code = NULL, processing_error_message = NULL,
                    failure_reason = NULL, source_metadata_json = ?
                    WHERE id = ?""",
-                (normalized_hash, json.dumps(source_metadata), job["version_id"]),
+                (
+                    normalized_hash, json.dumps(source_metadata),
+                    index_job["version_id"],
+                ),
             )
+            if is_video:
+                # The source video's readiness follows its linked transcript index.
+                connection.execute(
+                    """UPDATE document_versions SET status = 'completed',
+                       ingestion_status = 'completed', extraction_status = 'completed',
+                       indexing_status = 'completed', normalized_content_hash = ?,
+                       completed_at = CURRENT_TIMESTAMP, processing_error_code = NULL,
+                       processing_error_message = NULL, failure_reason = NULL,
+                       source_metadata_json = ?
+                       WHERE id = ? AND organization_id = ?""",
+                    (
+                        normalized_hash, json.dumps(source_metadata), job["version_id"],
+                        job["organization_id"],
+                    ),
+                )
             connection.execute(
                 """UPDATE document_contents SET processing_status = 'completed'
                    WHERE id = ? AND organization_id = ? AND owner_id = ?""",
@@ -1244,8 +1543,22 @@ def process_job(job_id: str) -> None:
                    content_id = ?, processing_status = 'completed',
                    processing_error = NULL, updated_at = CURRENT_TIMESTAMP
                    WHERE id = ?""",
-                (job["version_id"], content_id, job["document_id"]),
+                (
+                    index_job["version_id"], content_id,
+                    index_job["document_id"],
+                ),
             )
+            if is_video:
+                connection.execute(
+                    """UPDATE documents SET current_version_id = ?, content_id = ?,
+                       processing_status = 'completed', processing_error = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+                    (
+                        job["version_id"], content_id, job["document_id"],
+                        job["organization_id"], job["owner_id"],
+                    ),
+                )
             connection.execute(
                 """UPDATE ingestion_jobs SET status = 'completed',
                    completed_at = CURRENT_TIMESTAMP, locked_by = NULL, locked_at = NULL,
@@ -1263,6 +1576,12 @@ def process_job(job_id: str) -> None:
                             reused_existing_content or reused_deleted_content
                         ),
                         "reused_deleted_content": reused_deleted_content,
+                        "transcript_document_id": (
+                            transcript_target.document_id if transcript_target else None
+                        ),
+                        "transcript_filename": (
+                            transcript_target.display_filename if transcript_target else None
+                        ),
                         "message": (
                             "Deleted document content was re-uploaded successfully."
                             if reused_deleted_content
@@ -1278,17 +1597,17 @@ def process_job(job_id: str) -> None:
             )
             deleted = connection.execute(
                 "SELECT deleted_at IS NOT NULL FROM documents WHERE id = ?",
-                (job["document_id"],),
+                (index_job["document_id"],),
             ).fetchone()[0]
             if deleted:
                 connection.execute(
                     """UPDATE chunks SET deleted_at = CURRENT_TIMESTAMP
                        WHERE document_id = ? AND version_id = ?""",
-                    (job["document_id"], job["version_id"]),
+                    (index_job["document_id"], index_job["version_id"]),
                 )
         if deleted:
             get_vector_store().set_document_deleted(
-                str(job["organization_id"]), int(job["document_id"]), True
+                str(job["organization_id"]), int(index_job["document_id"]), True
             )
         log_audit_event(
             event_type="ingestion.job.transition",
@@ -1336,6 +1655,15 @@ def process_job(job_id: str) -> None:
                 int(batch["upload_batch_id"]), int(batch["owner_id"]), "successful"
             )
     except Exception as error:
+        if transcript_storage_key:
+            # Remove only an unreferenced file from a rolled-back target creation.
+            with get_connection() as connection:
+                referenced = connection.execute(
+                    "SELECT 1 FROM document_versions WHERE storage_key = ?",
+                    (transcript_storage_key,),
+                ).fetchone()
+            if referenced is None:
+                resolve_storage_key(transcript_storage_key).unlink(missing_ok=True)
         logger.exception(
             "Document ingestion failed",
             extra={

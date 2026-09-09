@@ -1356,6 +1356,40 @@ def _migrate_azure_devops_connections_v17(connection: sqlite3.Connection) -> Non
     )
 
 
+def _migrate_video_transcript_documents_v18(connection: sqlite3.Connection) -> None:
+    """Link each video and video version to its persistent transcript records."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS video_transcript_documents (
+            video_document_id INTEGER PRIMARY KEY,
+            transcript_document_id INTEGER NOT NULL UNIQUE,
+            organization_id TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (video_document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            FOREIGN KEY (transcript_document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id) REFERENCES organizations(id),
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS video_transcript_versions (
+            video_version_id INTEGER PRIMARY KEY,
+            transcript_version_id INTEGER NOT NULL UNIQUE,
+            organization_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (video_version_id) REFERENCES document_versions(id) ON DELETE CASCADE,
+            FOREIGN KEY (transcript_version_id) REFERENCES document_versions(id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id) REFERENCES organizations(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_transcript_documents_owner
+            ON video_transcript_documents(organization_id, owner_id);
+        CREATE INDEX IF NOT EXISTS idx_video_transcript_versions_org
+            ON video_transcript_versions(organization_id);
+        INSERT OR IGNORE INTO schema_migrations (version)
+            VALUES ('018_video_transcript_documents');
+        """
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1435,6 +1469,7 @@ def initialize_database() -> None:
             _migrate_projects_v15(connection)
             _migrate_project_folders_v16(connection)
             _migrate_azure_devops_connections_v17(connection)
+            _migrate_video_transcript_documents_v18(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

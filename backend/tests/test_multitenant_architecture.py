@@ -653,10 +653,21 @@ class MultitenantArchitectureTests(unittest.TestCase):
 
     def test_video_transcript_persists_reuses_and_reprocesses_changed_bytes(self) -> None:
         """Video uploads persist timestamps, reuse identical bytes, and version changes."""
+        with database.get_connection() as connection:
+            connection.execute(
+                """INSERT INTO projects (id, organization_id, user_id, name)
+                   VALUES ('video-project', 'org-a', 10, 'Video Project')"""
+            )
+            connection.execute(
+                """INSERT INTO folders
+                   (id, organization_id, user_id, project_id, name)
+                   VALUES ('video-folder', 'org-a', 10, 'video-project', 'Reviews')"""
+            )
         first_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2-original"
         first = self.client.post(
             "/api/documents/upload",
             files={"file": ("Manager Review.mp4", first_bytes, "video/mp4")},
+            data={"project_id": "video-project", "folder_id": "video-folder"},
             headers={"Idempotency-Key": "video-first", "Host": "localhost"},
         )
         self.assertEqual(first.status_code, 202, first.text)
@@ -684,20 +695,58 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.assertTrue(ingestion_jobs.run_one("worker-video-first"))
         with database.get_connection() as connection:
             persisted = connection.execute(
-                """SELECT dc.extracted_text, c.source_type, c.source_location_json
-                   FROM document_versions dv
-                   JOIN document_contents dc ON dc.id = dv.content_id
-                   JOIN chunks c ON c.version_id = dv.id
-                   WHERE dv.id = ?""",
+                """SELECT dc.extracted_text, c.source_type, c.source_location_json,
+                          td.id AS transcript_document_id, td.display_filename,
+                          tv.storage_key, tv.source_metadata_json,
+                          td.project_id, td.folder_id
+                   FROM video_transcript_versions link
+                   JOIN document_versions tv ON tv.id = link.transcript_version_id
+                   JOIN documents td ON td.id = tv.document_id
+                   JOIN document_contents dc ON dc.id = tv.content_id
+                   JOIN chunks c ON c.version_id = tv.id
+                   WHERE link.video_version_id = ?""",
                 (first_body["version_id"],),
             ).fetchone()
+            video_chunk_count = connection.execute(
+                "SELECT COUNT(*) FROM chunks WHERE version_id = ?",
+                (first_body["version_id"],),
+            ).fetchone()[0]
         self.assertIn("[0.000 --> 4.250]", persisted["extracted_text"])
         self.assertEqual(persisted["source_type"], "video")
         self.assertIn("timestamp_start_seconds", persisted["source_location_json"])
+        self.assertEqual(persisted["display_filename"], "Manager Review_transcript.txt")
+        self.assertIn("source_video_document_id", persisted["source_metadata_json"])
+        self.assertEqual(persisted["project_id"], "video-project")
+        self.assertEqual(persisted["folder_id"], "video-folder")
+        self.assertEqual(video_chunk_count, 0)
+        self.assertEqual(
+            database.UPLOAD_DIRECTORY.joinpath(persisted["storage_key"]).read_text(),
+            persisted["extracted_text"],
+        )
+        self.assertEqual(len(self.fake_store.points), 1)
+        self.assertEqual(
+            next(iter(self.fake_store.points.values())).document_id,
+            persisted["transcript_document_id"],
+        )
+        completed_job = self.client.get(
+            f"/api/jobs/{first_body['job_id']}", headers={"Host": "localhost"}
+        ).json()
+        self.assertEqual(
+            completed_job["result"]["transcript_document_id"],
+            persisted["transcript_document_id"],
+        )
+        listed = self.client.get(
+            "/documents?project_id=video-project&folder_id=video-folder",
+            headers={"Host": "localhost"},
+        ).json()["documents"]
+        self.assertIn("Manager Review_transcript.txt", {
+            document["display_filename"] for document in listed
+        })
 
         unchanged = self.client.post(
             "/api/documents/upload",
             files={"file": ("Manager Review.mp4", first_bytes, "video/mp4")},
+            data={"project_id": "video-project", "folder_id": "video-folder"},
             headers={"Idempotency-Key": "video-unchanged", "Host": "localhost"},
         )
         self.assertEqual(unchanged.status_code, 202)
@@ -720,11 +769,50 @@ class MultitenantArchitectureTests(unittest.TestCase):
         ).json()
         self.assertEqual(reused["status"], "completed")
         self.assertTrue(reused["result"]["content_reused"])
+        self.assertNotEqual(
+            reused["result"]["transcript_document_id"],
+            persisted["transcript_document_id"],
+        )
+        with database.get_connection() as connection:
+            alias_transcript = connection.execute(
+                """SELECT d.project_id, d.folder_id
+                   FROM video_transcript_documents link
+                   JOIN documents d ON d.id = link.transcript_document_id
+                   WHERE link.video_document_id = ?""",
+                (alias["document_id"],),
+            ).fetchone()
+        self.assertIsNone(alias_transcript["project_id"])
+        self.assertIsNone(alias_transcript["folder_id"])
+
+        # Re-entering a completed job exercises recovery without duplicating
+        # transcript records, chunks, files, or Qdrant points.
+        with database.get_connection() as connection:
+            before_retry = connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM video_transcript_documents),
+                       (SELECT COUNT(*) FROM video_transcript_versions),
+                       (SELECT COUNT(*) FROM chunks)"""
+            ).fetchone()
+            connection.execute(
+                "UPDATE ingestion_jobs SET status = 'processing' WHERE id = ?",
+                (alias["job_id"],),
+            )
+        ingestion_jobs.process_job(alias["job_id"])
+        with database.get_connection() as connection:
+            after_retry = connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM video_transcript_documents),
+                       (SELECT COUNT(*) FROM video_transcript_versions),
+                       (SELECT COUNT(*) FROM chunks)"""
+            ).fetchone()
+        self.assertEqual(tuple(before_retry), tuple(after_retry))
+        self.assertEqual(len(self.fake_store.points), 2)
 
         changed_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2-modified"
         changed = self.client.post(
             "/api/documents/upload",
             files={"file": ("Manager Review.mp4", changed_bytes, "video/mp4")},
+            data={"project_id": "video-project", "folder_id": "video-folder"},
             headers={"Idempotency-Key": "video-changed", "Host": "localhost"},
         )
         self.assertEqual(changed.status_code, 202, changed.text)
@@ -767,6 +855,53 @@ class MultitenantArchitectureTests(unittest.TestCase):
         self.assertEqual(len(versions), 2)
         self.assertNotEqual(versions[0]["file_hash"], versions[1]["file_hash"])
         self.assertIn("revised target", versions[1]["extracted_text"])
+        with database.get_connection() as connection:
+            transcript_versions = connection.execute(
+                """SELECT td.display_filename, COUNT(*) AS version_count
+                   FROM video_transcript_documents link
+                   JOIN documents td ON td.id = link.transcript_document_id
+                   JOIN document_versions tv ON tv.document_id = td.id
+                   WHERE link.video_document_id = ?
+                   GROUP BY td.id""",
+                (first_body["document_id"],),
+            ).fetchone()
+        self.assertEqual(transcript_versions["display_filename"], "Manager Review_transcript.txt")
+        self.assertEqual(transcript_versions["version_count"], 2)
+
+    def test_video_transcription_failure_never_marks_video_ready(self) -> None:
+        """A terminal transcription error remains visible and creates no transcript."""
+        video = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2-failure"
+        accepted = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("Failure.mp4", video, "video/mp4")},
+            headers={"Idempotency-Key": "video-failure", "Host": "localhost"},
+        ).json()
+        with patch.object(
+            ingestion_jobs,
+            "_extract_bundle",
+            side_effect=DocumentParseError(
+                "Video transcription failed.", code="video_transcription_failed"
+            ),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-video-failure"))
+        result = self.client.get(
+            f"/api/jobs/{accepted['job_id']}", headers={"Host": "localhost"}
+        ).json()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "video_transcription_failed")
+        self.assertEqual(result["error"]["message"], "Video transcription failed.")
+        with database.get_connection() as connection:
+            video_status = connection.execute(
+                "SELECT processing_status, current_version_id FROM documents WHERE id = ?",
+                (accepted["document_id"],),
+            ).fetchone()
+            link_count = connection.execute(
+                "SELECT COUNT(*) FROM video_transcript_documents WHERE video_document_id = ?",
+                (accepted["document_id"],),
+            ).fetchone()[0]
+        self.assertEqual(video_status["processing_status"], "failed")
+        self.assertIsNone(video_status["current_version_id"])
+        self.assertEqual(link_count, 0)
 
     def test_video_upload_uses_video_specific_size_limit(self) -> None:
         """Video limits override the generic document limit in either direction."""
