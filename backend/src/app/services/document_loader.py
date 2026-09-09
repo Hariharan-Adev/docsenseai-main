@@ -12,6 +12,11 @@ from app.services.image_processor import (
     ImageProcessingError,
     extract_image_text,
 )
+from app.services.video_transcription import (
+    VIDEO_EXTENSIONS,
+    VideoTranscriptionError,
+    transcribe_video,
+)
 
 
 class DocumentParseError(ValueError):
@@ -214,6 +219,20 @@ class OcrParser:
             raise DocumentParseError(str(error), code=error.code) from error
 
 
+class VideoParser:
+    """Convert supported video speech into a timestamped plain-text transcript."""
+
+    def extract_text(self, file_path: Path) -> str:
+        try:
+            transcript = transcribe_video(file_path)
+        except VideoTranscriptionError as error:
+            raise DocumentParseError(str(error), code="video_transcription_failed") from error
+        return "\n".join(
+            f"[{segment.start_seconds:.3f} --> {segment.end_seconds:.3f}] {segment.text}"
+            for segment in transcript.segments
+        )
+
+
 PARSER_REGISTRY: dict[str, DocumentParser] = {}
 
 
@@ -229,6 +248,7 @@ register_parser((".xlsx", ".xls"), ExcelParser())
 register_parser((".csv",), CsvParser())
 register_parser((".pptx", ".ppt"), PowerPointParser())
 register_parser(tuple(IMAGE_EXTENSIONS), OcrParser())
+register_parser(tuple(VIDEO_EXTENSIONS), VideoParser())
 
 SUPPORTED_EXTENSIONS = frozenset(PARSER_REGISTRY)
 

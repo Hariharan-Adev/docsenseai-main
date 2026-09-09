@@ -21,6 +21,7 @@ from app.utils.document_content import generate_unique_display_filename, sanitiz
 from app.utils.file_validation import validate_file_signature
 from app.utils.rate_limit import enforce_request_limit
 from app.services.storage import storage_key_for, write_storage_bytes
+from app.services.video_transcription import VIDEO_EXTENSIONS
 from app.utils.observability import log_event
 
 router = APIRouter(prefix="/api", tags=["ingestion-jobs"])
@@ -97,7 +98,16 @@ async def queue_document_upload(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(content) > settings.max_file_size_mb * 1024 * 1024:
+    extension = Path(original_filename).suffix.lower()
+    if extension in VIDEO_EXTENSIONS:
+        # Videos have their own configurable limit because media is typically
+        # larger than documents and is processed by a separate provider.
+        if len(content) > settings.max_video_file_size_mb * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum video file size is {settings.max_video_file_size_mb} MB.",
+            )
+    elif len(content) > settings.max_file_size_mb * 1024 * 1024:
         raise HTTPException(
             status_code=400,
             detail=f"Maximum file size is {settings.max_file_size_mb} MB.",
@@ -187,7 +197,7 @@ async def queue_document_upload(
             if target is not None:
                 document_id = int(target["id"])
                 identical = connection.execute(
-                    """SELECT id FROM document_versions
+                    """SELECT id, status FROM document_versions
                        WHERE document_id = ? AND organization_id = ?
                          AND file_hash = ? AND deleted_at IS NULL
                          AND status <> 'cancelled'
@@ -196,6 +206,32 @@ async def queue_document_upload(
                 ).fetchone()
                 if identical and not explicit_version:
                     saved_path.unlink(missing_ok=True)
+                    if extension in VIDEO_EXTENSIONS:
+                        existing_job = connection.execute(
+                            """SELECT * FROM ingestion_jobs
+                               WHERE organization_id = ? AND version_id = ?
+                               ORDER BY created_at DESC LIMIT 1""",
+                            (organization_id, identical["id"]),
+                        ).fetchone()
+                        if existing_job and existing_job["status"] in {
+                            "queued", "processing", "retry_scheduled"
+                        }:
+                            return {
+                                "message": "Existing video processing was reused.",
+                                **_job_response(existing_job),
+                                "content_reused": True,
+                                "processing_label": "Video processing",
+                            }
+                        if identical["status"] == "completed":
+                            return {
+                                "message": "Existing video transcript and index were reused.",
+                                "status": "completed",
+                                "job_id": None,
+                                "document_id": document_id,
+                                "version_id": int(identical["id"]),
+                                "content_reused": True,
+                                "processing_label": "Video processing",
+                            }
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail={
@@ -230,12 +266,13 @@ async def queue_document_upload(
                         stored_filename, file_hash, content_id, visibility,
                         collection_id, upload_batch_id, relative_path,
                         processing_status, updated_at, project_id, folder_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued',
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                CURRENT_TIMESTAMP, ?, ?)""",
                     (
                         owner_id, organization_id, original_filename, display_filename,
                         stored_filename, file_hash, content_id, visibility.value,
                         collection_id, upload_batch_id, safe_relative_path,
+                        "video_processing" if extension in VIDEO_EXTENSIONS else "queued",
                         project_id, folder_id,
                     ),
                 )
@@ -265,7 +302,9 @@ async def queue_document_upload(
                 version_id=version_id,
                 storage_key=storage_key,
                 idempotency_key=effective_key,
-                allow_active_content_reuse=explicit_version,
+                allow_active_content_reuse=(
+                    explicit_version or extension in VIDEO_EXTENSIONS
+                ),
                 connection=connection,
             )
             accepted_job = connection.execute(
@@ -278,6 +317,17 @@ async def queue_document_upload(
                 and int(accepted_job["version_id"]) != version_id
             ):
                 raise _ExistingUploadRequest(dict(accepted_job))
+            if target is not None and extension in VIDEO_EXTENSIONS:
+                # Keep the completed version current while clearly exposing
+                # that an accepted replacement video is being processed.
+                connection.execute(
+                    """UPDATE documents
+                       SET processing_status = 'video_processing',
+                           processing_error = NULL,
+                           updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ? AND organization_id = ?""",
+                    (document_id, organization_id),
+                )
     except _ExistingUploadRequest as duplicate:
         saved_path.unlink(missing_ok=True)
         return {
@@ -312,6 +362,9 @@ async def queue_document_upload(
         "job_id": job_id,
         "document_id": document_id,
         "version_id": version_id,
+        "processing_label": (
+            "Video processing" if extension in VIDEO_EXTENSIONS else "Processing"
+        ),
     }
 
 

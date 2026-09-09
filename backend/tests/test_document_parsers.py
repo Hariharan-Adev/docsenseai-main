@@ -46,7 +46,7 @@ class DocumentParserTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_registry_contains_every_required_extension(self):
-        required = {".txt", ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
+        required = {".txt", ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp", ".mp4"}
         self.assertEqual(SUPPORTED_EXTENSIONS, required)
         self.assertIsInstance(PARSER_REGISTRY[".xlsx"], ExcelParser)
         self.assertIsInstance(PARSER_REGISTRY[".ppt"], PowerPointParser)

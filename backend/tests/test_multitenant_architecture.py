@@ -651,6 +651,147 @@ class MultitenantArchitectureTests(unittest.TestCase):
         self.assertEqual(chunk["source_type"], "image")
         self.assertIn("image_ocr", chunk["source_location_json"])
 
+    def test_video_transcript_persists_reuses_and_reprocesses_changed_bytes(self) -> None:
+        """Video uploads persist timestamps, reuse identical bytes, and version changes."""
+        first_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2-original"
+        first = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("Manager Review.mp4", first_bytes, "video/mp4")},
+            headers={"Idempotency-Key": "video-first", "Host": "localhost"},
+        )
+        self.assertEqual(first.status_code, 202, first.text)
+        first_body = first.json()
+        self.assertEqual(first_body["processing_label"], "Video processing")
+        with database.get_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT processing_status FROM documents WHERE id = ?",
+                    (first_body["document_id"],),
+                ).fetchone()["processing_status"],
+                "video_processing",
+            )
+
+        first_chunks = ([SourceChunk(
+            "[0.000 --> 4.250] Approve the annual target.",
+            "video",
+            {
+                "timestamp_start_seconds": 0.0,
+                "timestamp_end_seconds": 4.25,
+                "content_type": "video_transcript",
+            },
+        )], {"source_type": "video", "transcript_format": "timestamped_segments"}, None)
+        with patch.object(ingestion_jobs, "_extract_bundle", return_value=first_chunks):
+            self.assertTrue(ingestion_jobs.run_one("worker-video-first"))
+        with database.get_connection() as connection:
+            persisted = connection.execute(
+                """SELECT dc.extracted_text, c.source_type, c.source_location_json
+                   FROM document_versions dv
+                   JOIN document_contents dc ON dc.id = dv.content_id
+                   JOIN chunks c ON c.version_id = dv.id
+                   WHERE dv.id = ?""",
+                (first_body["version_id"],),
+            ).fetchone()
+        self.assertIn("[0.000 --> 4.250]", persisted["extracted_text"])
+        self.assertEqual(persisted["source_type"], "video")
+        self.assertIn("timestamp_start_seconds", persisted["source_location_json"])
+
+        unchanged = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("Manager Review.mp4", first_bytes, "video/mp4")},
+            headers={"Idempotency-Key": "video-unchanged", "Host": "localhost"},
+        )
+        self.assertEqual(unchanged.status_code, 202)
+        self.assertEqual(unchanged.json()["status"], "completed")
+        self.assertTrue(unchanged.json()["content_reused"])
+
+        alias = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("Manager Review Copy.mp4", first_bytes, "video/mp4")},
+            headers={"Idempotency-Key": "video-alias", "Host": "localhost"},
+        ).json()
+        with patch.object(
+            ingestion_jobs,
+            "_extract_bundle",
+            side_effect=AssertionError("unchanged video must not be transcribed twice"),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-video-reuse"))
+        reused = self.client.get(
+            f"/api/jobs/{alias['job_id']}", headers={"Host": "localhost"}
+        ).json()
+        self.assertEqual(reused["status"], "completed")
+        self.assertTrue(reused["result"]["content_reused"])
+
+        changed_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2-modified"
+        changed = self.client.post(
+            "/api/documents/upload",
+            files={"file": ("Manager Review.mp4", changed_bytes, "video/mp4")},
+            headers={"Idempotency-Key": "video-changed", "Host": "localhost"},
+        )
+        self.assertEqual(changed.status_code, 202, changed.text)
+        changed = changed.json()
+        with database.get_connection() as connection:
+            changed_document = connection.execute(
+                """SELECT d.processing_status, d.current_version_id, d.content_id,
+                          current.content_id AS current_content_id,
+                          pending.content_id AS pending_content_id
+                   FROM documents d
+                   JOIN document_versions current ON current.id = d.current_version_id
+                   JOIN document_versions pending ON pending.id = ?
+                   WHERE d.id = ?""",
+                (changed["version_id"], first_body["document_id"]),
+            ).fetchone()
+        self.assertEqual(changed_document["processing_status"], "video_processing")
+        self.assertEqual(changed_document["current_version_id"], first_body["version_id"])
+        self.assertEqual(changed_document["content_id"], changed_document["current_content_id"])
+        self.assertNotEqual(changed_document["content_id"], changed_document["pending_content_id"])
+        changed_chunks = ([SourceChunk(
+            "[0.000 --> 5.000] The revised target is rejected.",
+            "video",
+            {
+                "timestamp_start_seconds": 0.0,
+                "timestamp_end_seconds": 5.0,
+                "content_type": "video_transcript",
+            },
+        )], {"source_type": "video", "transcript_format": "timestamped_segments"}, None)
+        with patch.object(ingestion_jobs, "_extract_bundle", return_value=changed_chunks):
+            self.assertTrue(ingestion_jobs.run_one("worker-video-changed"))
+        with database.get_connection() as connection:
+            versions = connection.execute(
+                """SELECT dv.file_hash, dc.extracted_text
+                   FROM document_versions dv
+                   JOIN document_contents dc ON dc.id = dv.content_id
+                   WHERE dv.document_id = ? AND dv.status = 'completed'
+                   ORDER BY dv.version_number""",
+                (first_body["document_id"],),
+            ).fetchall()
+        self.assertEqual(len(versions), 2)
+        self.assertNotEqual(versions[0]["file_hash"], versions[1]["file_hash"])
+        self.assertIn("revised target", versions[1]["extracted_text"])
+
+    def test_video_upload_uses_video_specific_size_limit(self) -> None:
+        """Video limits override the generic document limit in either direction."""
+        video = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"x" * (1024 * 1024)
+        with patch("app.routes.ingestion.settings.max_file_size_mb", 1), patch(
+            "app.routes.ingestion.settings.max_video_file_size_mb", 2
+        ):
+            accepted = self.client.post(
+                "/api/documents/upload",
+                files={"file": ("within-video-limit.mp4", video, "video/mp4")},
+                headers={"Idempotency-Key": "video-size-ok", "Host": "localhost"},
+            )
+        self.assertEqual(accepted.status_code, 202, accepted.text)
+
+        with patch("app.routes.ingestion.settings.max_file_size_mb", 3), patch(
+            "app.routes.ingestion.settings.max_video_file_size_mb", 1
+        ):
+            rejected = self.client.post(
+                "/api/documents/upload",
+                files={"file": ("over-video-limit.mp4", video, "video/mp4")},
+                headers={"Idempotency-Key": "video-size-rejected", "Host": "localhost"},
+            )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(rejected.json()["detail"], "Maximum video file size is 1 MB.")
+
     def test_duplicate_versioning_reuse_and_storage_are_tenant_safe(self) -> None:
         first = self.upload(b"alpha", "duplicate-v1").json()
         self.assertTrue(ingestion_jobs.run_one("worker-duplicate"))

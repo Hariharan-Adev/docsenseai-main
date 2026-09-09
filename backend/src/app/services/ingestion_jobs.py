@@ -21,7 +21,7 @@ from app.config import settings
 from db.database import UPLOAD_DIRECTORY, get_connection
 from app.services.embeddings import create_embeddings
 from app.services.document_loader import DocumentParseError
-from app.services.source_extraction import extract_source_chunks, extract_source_metadata
+from app.services.source_extraction import SourceChunk, extract_source_chunks, extract_source_metadata
 from app.services.vector_store import (
     VectorPoint,
     get_vector_store,
@@ -47,6 +47,7 @@ from app.services.workbooks import extract_workbook, workbook_from_pdf, workbook
 from app.utils.security import validate_chunks, validate_extracted_text
 from app.utils.observability import log_event
 from app.services.storage import resolve_storage_key, storage_key_for, write_storage_bytes
+from app.services.video_transcription import VIDEO_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,17 @@ class ContentResolution:
     mode: str
     content_id: int | None = None
     reusable_chunks: tuple[sqlite3.Row, ...] = ()
+
+
+def _video_source_metadata(source_chunks) -> dict[str, object]:
+    """Describe a transcript without storing provider secrets or original media."""
+    return {
+        "source_type": "video",
+        "transcript_format": "timestamped_segments",
+        "transcription_provider": "groq",
+        "transcription_model": settings.groq_transcription_model,
+        "segment_count": len(source_chunks),
+    }
 
 
 def _extract_bundle_child(
@@ -84,6 +96,8 @@ def _extract_bundle_child(
             include_hidden=include_hidden,
             include_very_hidden=include_very_hidden,
         )
+        if path.suffix.lower() in VIDEO_EXTENSIONS:
+            source_metadata = _video_source_metadata(source_chunks)
         workbook = (
             extract_workbook(
                 path,
@@ -115,6 +129,8 @@ def _extract_bundle(path: Path):
             include_hidden=hidden,
             include_very_hidden=very_hidden,
         )
+        if path.suffix.lower() in VIDEO_EXTENSIONS:
+            source_metadata = _video_source_metadata(source_chunks)
         workbook = (
             extract_workbook(
                 path,
@@ -255,6 +271,52 @@ def _embeddings_are_compatible(rows: tuple[sqlite3.Row, ...]) -> bool:
         and bool(row["vector_point_id"])
         for row in rows
     )
+
+
+def _reusable_video_bundle(job, path: Path):
+    """Load an unchanged video's transcript before making another provider call."""
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return None
+    with get_connection() as connection:
+        version = connection.execute(
+            """SELECT dv.id, dv.source_metadata_json
+               FROM document_versions dv
+               JOIN documents d ON d.id = dv.document_id
+               WHERE dv.organization_id = ? AND d.owner_id = ?
+                 AND dv.file_hash = ? AND dv.id <> ?
+                 AND dv.status = 'completed' AND dv.deleted_at IS NULL
+                 AND d.deleted_at IS NULL
+               ORDER BY dv.completed_at DESC, dv.id DESC LIMIT 1""",
+            (
+                job["organization_id"], job["owner_id"],
+                job["expected_file_hash"], job["version_id"],
+            ),
+        ).fetchone()
+        if version is None:
+            return None
+        rows = connection.execute(
+            """SELECT text, source_type, source_location_json
+               FROM chunks
+               WHERE organization_id = ? AND version_id = ?
+                 AND deleted_at IS NULL
+               ORDER BY chunk_index""",
+            (job["organization_id"], version["id"]),
+        ).fetchall()
+    if not rows:
+        return None
+    try:
+        source_chunks = [
+            SourceChunk(
+                str(row["text"]),
+                str(row["source_type"] or "video"),
+                json.loads(row["source_location_json"] or "{}"),
+            )
+            for row in rows
+        ]
+        metadata = json.loads(version["source_metadata_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return source_chunks, metadata or _video_source_metadata(source_chunks), None
 
 
 def _resolve_content(
@@ -872,11 +934,13 @@ def process_job(job_id: str) -> None:
     failure_stage = "stored_upload_validation"
     try:
         payload = json.loads(job["payload_json"])
-        allow_active_content_reuse = bool(
-            payload.get("allow_active_content_reuse", False)
-        ) or job["current_version_id"] is not None
         path = resolve_storage_key(
             payload.get("storage_key") or payload["stored_filename"]
+        )
+        allow_active_content_reuse = (
+            bool(payload.get("allow_active_content_reuse", False))
+            or job["current_version_id"] is not None
+            or path.suffix.lower() in VIDEO_EXTENSIONS
         )
         if not path.is_file():
             raise FileNotFoundError("Stored upload is unavailable.")
@@ -886,7 +950,10 @@ def process_job(job_id: str) -> None:
         validate_file_signature(path.name, stored_bytes)
         failure_stage = "extraction"
         extraction_started = perf_counter()
-        source_chunks, source_metadata, workbook = _extract_bundle(path)
+        reusable_video = _reusable_video_bundle(job, path)
+        source_chunks, source_metadata, workbook = (
+            reusable_video if reusable_video is not None else _extract_bundle(path)
+        )
         extraction_duration_ms = (perf_counter() - extraction_started) * 1000
         failure_stage = "duplicate_resolution"
         with get_connection() as connection:

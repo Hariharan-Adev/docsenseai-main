@@ -35,9 +35,10 @@ interface UploadItem {
 }
 
 const defaultConfig: UploadConfig = {
-  supported_extensions: ['.txt', '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp'],
+  supported_extensions: ['.txt', '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp', '.mp4'],
   archive_extensions: ['.zip'],
   max_file_size_mb: 25,
+  max_video_file_size_mb: 25,
   max_zip_upload_mb: 50,
   max_folder_files: 25,
   max_folder_total_size_mb: 200,
@@ -93,6 +94,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
 
   const selectFiles = (incoming: File[], isFolder: boolean) => {
     const maxBytes = config.max_file_size_mb * 1024 * 1024
+    const maxVideoBytes = config.max_video_file_size_mb * 1024 * 1024
     const maxZipBytes = config.max_zip_upload_mb * 1024 * 1024
     const knownNames = new Set(documents.map(document => document.name.toLowerCase()))
     const selected = incoming.map(file => {
@@ -102,7 +104,10 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
       let validation: Validation = 'Ready'
       if (!config.supported_extensions.includes(suffix) && !isArchive) validation = 'Unsupported'
       else if (file.size === 0) validation = 'Empty'
-      else if (file.size > (isArchive ? maxZipBytes : maxBytes)) validation = 'Too large'
+      else if (
+        file.size > (isArchive ? maxZipBytes : maxBytes)
+        || suffix === '.mp4' && file.size > maxVideoBytes
+      ) validation = 'Too large'
       else if (knownNames.has(file.name.toLowerCase())) validation = 'Duplicate candidate'
       return {
         id: uploadItemId(),
@@ -311,7 +316,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
           <div className="mt-3 max-h-64 overflow-auto rounded-xl border border-slate-200">
             <table className="w-full min-w-[680px] text-left text-[10px]">
               <thead className="sticky top-0 bg-slate-50 text-slate-500"><tr><th className="p-2">File</th><th className="p-2">Relative path</th><th className="p-2">Type</th><th className="p-2">Size</th><th className="p-2">Validation</th><th className="p-2">Status</th></tr></thead>
-              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.result?.content_reused ? 'restored' : item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
+              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.result?.content_reused ? 'reused' : extension(item.file) === '.mp4' && ['uploading', 'processing'].includes(item.status) ? 'Video processing' : item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
             </table>
           </div>
 

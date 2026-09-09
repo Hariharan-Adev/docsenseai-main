@@ -29,6 +29,8 @@ def validate_file_signature(filename: str, content: bytes) -> None:
     if content.startswith(b"MZ"):
         raise HTTPException(status_code=400, detail="Executable files are not supported.")
     suffix = Path(filename).suffix.lower()
+    if suffix == ".mp4":
+        _validate_mp4_header(content)
     signatures = _SIGNATURES.get(suffix)
     if signatures and not any(content.startswith(signature) for signature in signatures):
         raise HTTPException(status_code=400, detail="The file content does not match its extension.")
@@ -36,6 +38,39 @@ def validate_file_signature(filename: str, content: bytes) -> None:
         raise HTTPException(status_code=400, detail="The file content does not match its extension.")
     if suffix in {".docx", ".xlsx", ".pptx"}:
         _validate_office_archive(content)
+
+
+def _validate_mp4_header(content: bytes) -> None:
+    """Require a bounded ISO-BMFF file-type box with plausible four-character brands."""
+    message = "The file content does not match its extension."
+    if len(content) < 16 or content[4:8] != b"ftyp":
+        raise HTTPException(status_code=400, detail=message)
+
+    box_size = int.from_bytes(content[:4], "big")
+    field_offset = 8
+    if box_size == 1:
+        if len(content) < 24:
+            raise HTTPException(status_code=400, detail=message)
+        box_size = int.from_bytes(content[8:16], "big")
+        field_offset = 16
+    minimum_size = field_offset + 8
+    if box_size < minimum_size or box_size > len(content) or (box_size - minimum_size) % 4:
+        raise HTTPException(status_code=400, detail=message)
+
+    brands = [content[field_offset:field_offset + 4]]
+    brands.extend(
+        content[offset:offset + 4]
+        for offset in range(field_offset + 8, box_size, 4)
+    )
+    # Registered brands are printable four-character codes; this rejects empty
+    # and binary values without narrowing uploads to a brittle brand allowlist.
+    if any(
+        len(brand) != 4
+        or not any(chr(value).isalnum() for value in brand)
+        or any(value < 0x20 or value > 0x7E for value in brand)
+        for brand in brands
+    ):
+        raise HTTPException(status_code=400, detail=message)
 
 
 def _validate_office_archive(content: bytes) -> None:

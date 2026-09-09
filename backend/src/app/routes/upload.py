@@ -33,6 +33,7 @@ from app.services.workbooks import (
     workbook_schema,
     workbook_text,
 )
+from app.services.video_transcription import VIDEO_EXTENSIONS
 from app.services.zip_archives import ArchiveValidationError, extract_member, inspect_archive, temporary_archive_directory
 from app.utils.audit import log_audit_event
 from app.utils.document_content import (
@@ -405,7 +406,16 @@ async def _process_document_upload(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(content) > settings.max_file_size_mb * 1024 * 1024:
+    extension = Path(original_filename).suffix.lower()
+    if extension in VIDEO_EXTENSIONS:
+        # Videos use the media-specific limit even when it is higher than the
+        # generic document limit.
+        if len(content) > settings.max_video_file_size_mb * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum video file size is {settings.max_video_file_size_mb} MB.",
+            )
+    elif len(content) > settings.max_file_size_mb * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"Maximum file size is {settings.max_file_size_mb} MB.")
     validate_file_signature(original_filename, content)
 
@@ -418,7 +428,6 @@ async def _process_document_upload(
         return _conflict(existing)
 
     UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    extension = Path(original_filename).suffix.lower()
     stored_name = f"{uuid4().hex}{extension}"
     saved_path = UPLOAD_DIRECTORY / stored_name
     saved_path.write_bytes(content)
@@ -449,6 +458,7 @@ async def _process_document_upload(
         return response
 
     workbook_data: WorkbookData | None = None
+    video_source_chunks = None
     try:
         if extension in {".xlsx", ".xls"}:
             workbook_data = extract_workbook(
@@ -461,6 +471,10 @@ async def _process_document_upload(
             source_chunks = extract_source_chunks(saved_path)
             workbook_data = workbook_from_pdf(saved_path) or workbook_from_pdf_chunks(source_chunks)
             extracted_text = "\n\n".join(chunk.text for chunk in source_chunks)
+        elif extension in VIDEO_EXTENSIONS:
+            # Keep the provider call single-use and retain timestamps in legacy ingestion.
+            video_source_chunks = extract_source_chunks(saved_path)
+            extracted_text = "\n\n".join(chunk.text for chunk in video_source_chunks)
         else:
             extracted_text = extract_text(saved_path)
         validate_extracted_text(extracted_text)
@@ -492,9 +506,13 @@ async def _process_document_upload(
         try:
             if workbook_data is None:
                 text_chunks = (
-                    chunk_image_text(normalized_text)
-                    if extension in IMAGE_EXTENSIONS
-                    else chunk_text(normalized_text)
+                    [chunk.text for chunk in video_source_chunks]
+                    if video_source_chunks is not None
+                    else (
+                        chunk_image_text(normalized_text)
+                        if extension in IMAGE_EXTENSIONS
+                        else chunk_text(normalized_text)
+                    )
                 )
                 chunk_records = [(chunk, None, None) for chunk in text_chunks]
             else:
@@ -510,8 +528,9 @@ async def _process_document_upload(
                 connection.executemany(
                     """
                     INSERT INTO chunks
-                        (content_id, chunk_index, text, embedding, sheet_name, row_number)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (content_id, chunk_index, text, embedding, sheet_name, row_number,
+                         source_type, source_location_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -521,6 +540,14 @@ async def _process_document_upload(
                             dumps(embedding),
                             record[1],
                             record[2],
+                            (
+                                video_source_chunks[index].source_type
+                                if video_source_chunks is not None else None
+                            ),
+                            (
+                                dumps(video_source_chunks[index].location)
+                                if video_source_chunks is not None else "{}"
+                            ),
                         )
                         for index, (record, embedding) in enumerate(zip(chunk_records, embeddings))
                     ],
@@ -589,6 +616,7 @@ def upload_config(current_user: dict[str, object] = Depends(get_current_user)) -
         "supported_extensions": sorted(ALLOWED_EXTENSIONS),
         "archive_extensions": [".zip"],
         "max_file_size_mb": settings.max_file_size_mb,
+        "max_video_file_size_mb": settings.max_video_file_size_mb,
         "max_zip_upload_mb": settings.max_zip_upload_mb,
         "max_folder_files": settings.max_folder_files,
         "max_folder_total_size_mb": settings.max_folder_total_size_mb,

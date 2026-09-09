@@ -76,6 +76,7 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_model: str = ""
+    groq_transcription_model: str = "whisper-large-v3-turbo"
     groq_vision_model: str = "qwen/qwen3.6-27b"
     llm_provider: str = ""
     azure_openai_endpoint: str = ""
@@ -113,6 +114,7 @@ class Settings(BaseSettings):
     groq_completion_cost_per_million: float = 0.0
     max_folder_files: int = 25
     max_file_size_mb: int = 25
+    max_video_file_size_mb: int = Field(default=25, ge=1, le=100)
     max_folder_total_size_mb: int = 200
     max_concurrent_file_processing: int = 3
     max_zip_upload_mb: int = 50

@@ -20,6 +20,11 @@ from app.services.image_processor import (
     extract_image_text,
 )
 from app.services.pdf_layout import extract_pdf_page_texts
+from app.services.video_transcription import (
+    VIDEO_EXTENSIONS,
+    VideoTranscriptionError,
+    transcribe_video,
+)
 
 DOCX_PARAGRAPH_CHUNK_WORDS = 800
 
@@ -42,6 +47,7 @@ def validate_source_location(source_type: str, location: dict[str, object]) -> N
         ),
         "csv": ("row_start", "row_end"),
         "text": ("line_start", "line_end"),
+        "video": ("timestamp_start_seconds", "timestamp_end_seconds"),
     }
     missing = [
         key for key in required.get(source_type, ())
@@ -56,9 +62,11 @@ def validate_source_location(source_type: str, location: dict[str, object]) -> N
         ("slide_start", "slide_end"),
         ("row_start", "row_end"),
         ("line_start", "line_end"),
+        ("timestamp_start_seconds", "timestamp_end_seconds"),
     ):
         if start in location and end in location:
-            if int(location[start]) < 1 or int(location[end]) < int(location[start]):
+            minimum = 0 if start.startswith("timestamp_") else 1
+            if float(location[start]) < minimum or float(location[end]) < float(location[start]):
                 raise DocumentParseError(
                     f"Invalid {source_type} source range: {start}/{end}."
                 )
@@ -805,6 +813,26 @@ def _text(path: Path) -> list[SourceChunk]:
     return result
 
 
+def _video(path: Path) -> list[SourceChunk]:
+    """Build timestamped chunks so RAG answers can cite the original video moment."""
+    try:
+        transcript = transcribe_video(path)
+    except VideoTranscriptionError as error:
+        raise DocumentParseError(str(error), code="video_transcription_failed") from error
+    return [
+        SourceChunk(
+            f"[{segment.start_seconds:.3f} --> {segment.end_seconds:.3f}] {segment.text}",
+            "video",
+            {
+                "timestamp_start_seconds": segment.start_seconds,
+                "timestamp_end_seconds": segment.end_seconds,
+                "content_type": "video_transcript",
+            },
+        )
+        for segment in transcript.segments
+    ]
+
+
 def extract_source_chunks(
     path: Path,
     *,
@@ -827,6 +855,8 @@ def extract_source_chunks(
         chunks = _csv(path)
     elif extension == ".txt":
         chunks = _text(path)
+    elif extension in VIDEO_EXTENSIONS:
+        chunks = _video(path)
     else:
         text = extract_text(path)
         if extension in IMAGE_EXTENSIONS:

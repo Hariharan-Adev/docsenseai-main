@@ -40,6 +40,7 @@ export interface UploadResponse {
   relative_path?: string | null
   duplicate_type?: string | null
   content_reused?: boolean
+  processing_label?: string
   file_type?: string
   document_type?: 'screenshot' | 'image'
   extraction?: 'ocr+vision-with-ocr-fallback'
@@ -178,6 +179,7 @@ export interface UploadConfig {
   supported_extensions: string[]
   archive_extensions: string[]
   max_file_size_mb: number
+  max_video_file_size_mb: number
   max_zip_upload_mb: number
   max_folder_files: number
   max_folder_total_size_mb: number

@@ -23,6 +23,7 @@ from app.auth import get_current_user
 from app.main import app
 from app.routes import documents, upload
 from app.services import vector_search
+from app.services.source_extraction import SourceChunk
 from app.services.vector_store import reset_vector_store_for_tests
 from app.services import vector_store
 from app.utils.document_content import generate_unique_display_filename, normalize_extracted_text, sanitize_filename
@@ -223,6 +224,33 @@ class DocumentDuplicateTests(unittest.TestCase):
             self.assertEqual(exact_duplicate.json()["duplicate_type"], "same_filename_same_content")
         finally:
             app.dependency_overrides.clear()
+
+    def test_legacy_video_upload_uses_video_specific_size_limit(self):
+        """Legacy uploads honor the video limit instead of the generic limit."""
+        video = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"x" * (1024 * 1024)
+        transcript_chunks = [
+            SourceChunk(
+                "[0.000 --> 1.000] Review approved.",
+                "video",
+                {
+                    "timestamp_start_seconds": 0.0,
+                    "timestamp_end_seconds": 1.0,
+                    "content_type": "video_transcript",
+                },
+            )
+        ]
+        with patch.object(upload.settings, "max_file_size_mb", 1), patch.object(
+            upload.settings, "max_video_file_size_mb", 2
+        ), patch.object(upload, "extract_source_chunks", return_value=transcript_chunks):
+            accepted = self.upload("within-video-limit.mp4", video)
+        self.assertEqual(response(accepted)[1]["status"], "processed")
+
+        with patch.object(upload.settings, "max_file_size_mb", 3), patch.object(
+            upload.settings, "max_video_file_size_mb", 1
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                self.upload("over-video-limit.mp4", video)
+        self.assertEqual(raised.exception.detail, "Maximum video file size is 1 MB.")
 
     def test_legacy_database_migration_preserves_documents(self):
         legacy_path = Path(self.temporary.name) / "legacy.db"
